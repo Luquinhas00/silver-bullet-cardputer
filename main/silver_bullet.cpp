@@ -242,6 +242,17 @@ void task_ataque(void *pvParameters) {
     DeauthPacket* deauth = (DeauthPacket*) heap_caps_malloc(sizeof(DeauthPacket), MALLOC_CAP_DMA);
     AuthPacket* auth = (AuthPacket*) heap_caps_malloc(sizeof(AuthPacket), MALLOC_CAP_DMA);
     
+    // BLINDAGEM CONTRA HARD FAULT (Prevenção de LoadProhibited)
+    if (pkt == NULL || deauth == NULL || auth == NULL) {
+        // Libera qualquer bloco que tenha sido alocado com sucesso antes de abortar
+        if (pkt != NULL) heap_caps_free(pkt);
+        if (deauth != NULL) heap_caps_free(deauth);
+        if (auth != NULL) heap_caps_free(auth);
+        
+        // Deleta a task de forma segura para não crashar o sistema inteiro
+        vTaskDelete(NULL); 
+    }
+    
     prng_state = esp_random(); 
     if (prng_state == 0) prng_state = 1; 
 
@@ -255,7 +266,7 @@ void task_ataque(void *pvParameters) {
     pkt->llc.oui[1] = 0x00;
     pkt->llc.oui[2] = 0x00;
     pkt->llc.ethertype = htons(0x0800);
-
+    
     while (true) {
         if (estado_atual.load() == ESTADO_ATIRAR && !alvo_perdido.load()) {
             
