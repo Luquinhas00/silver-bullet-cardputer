@@ -23,6 +23,8 @@
 #include <lwip/def.h> 
 #include <esp_heap_caps.h>
 #include "driver/temperature_sensor.h"
+#include "esp_random.h"
+#include <"esp_mac.h">
 
 // ===================================================================
 // 1. ESTRUTURAS DE PACOTES (OTIMIZADAS PARA ACESSO DIRETO DMA)
@@ -354,7 +356,7 @@ void task_display(void *pvParameters) {
                     else M5.Display.printf("> %s\n", get_nome_modo());
                     
                     M5.Display.setCursor(0, 60); M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-                    M5.Display.printf(">> INJETANDO: %d PPS <<\n", pps_atual.load());
+                    M5.Display.printf(">> INJETANDO: %u PPS <<\n", pps_atual.load());
                 } else {
                     M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK); 
                     M5.Display.setCursor(0, 40); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK); M5.Display.printf("⚠️ ALVO PERDIDO\n");
