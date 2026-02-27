@@ -1,5 +1,3 @@
-Markdown
-
 # 🔫 Silver Bullet
 
 > **Ferramenta Bare-Metal de Auditoria e Estresse Wi-Fi para CPEs e Equipamentos de Telecomunicações.**

