@@ -24,7 +24,7 @@
 #include <esp_heap_caps.h>
 #include "driver/temperature_sensor.h"
 #include "esp_random.h"
-#include <"esp_mac.h">
+#include "esp_mac.h"
 
 // ===================================================================
 // 1. ESTRUTURAS DE PACOTES (OTIMIZADAS PARA ACESSO DIRETO DMA)
@@ -178,15 +178,15 @@ IRAM_ATTR inline uint32_t fast_rand() {
     uint32_t x = prng_state; x ^= x << 13; x ^= x >> 17; x ^= x << 5; return prng_state = x;
 }
 
-IRAM_ATTR inline uint16_t fast_ip_checksum(IpHeader *ip) {
-    uint32_t acc = 0; uint16_t *data = (uint16_t *)ip;
+inline uint16_t fast_ip_checksum(IpHeader *ip) {
+    uint32_t acc = 0; uint16_t *data = (uint16_t *)(void *)ip;
     for (int i = 0; i < 10; ++i) acc += data[i];
     while (acc >> 16) acc = (acc & 0xffff) + (acc >> 16);
     return ~acc;
 }
 
 // Fix: Tratamento Strict Aliasing usando cópia segura em bytes (memcpy)
-IRAM_ATTR inline uint16_t fast_l4_checksum(IpHeader *ip, void *l4_hdr, size_t l4_len, uint8_t *payload, size_t payload_len) {
+inline uint16_t fast_l4_checksum(IpHeader *ip, void *l4_hdr, size_t l4_len, uint8_t *payload, size_t payload_len) {
     PseudoHeader psd;
     memcpy(psd.src_ip, ip->ip_src, 4); memcpy(psd.dest_ip, ip->ip_dest, 4);
     psd.reserved = 0; psd.protocol = ip->protocol; psd.l4_length = htons(l4_len + payload_len);
@@ -252,7 +252,7 @@ void escanear_redes() {
     }
     
     esp_wifi_set_mode(WIFI_MODE_STA);
-    wifi_scan_config_t scan_config = { .ssid = 0, .bssid = 0, .channel = 0, .show_hidden = true };
+    wifi_scan_config_t scan_config = {}; scan_config.show_hidden = true;
     esp_wifi_scan_start(&scan_config, true); 
     
     if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) {
@@ -356,7 +356,7 @@ void task_display(void *pvParameters) {
                     else M5.Display.printf("> %s\n", get_nome_modo());
                     
                     M5.Display.setCursor(0, 60); M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-                    M5.Display.printf(">> INJETANDO: %u PPS <<\n", pps_atual.load());
+                    M5.Display.printf(">> INJETANDO: %lu PPS <<\n",  (uint32_t)pps_atual.load());
                 } else {
                     M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK); 
                     M5.Display.setCursor(0, 40); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK); M5.Display.printf("⚠️ ALVO PERDIDO\n");
@@ -372,7 +372,7 @@ void task_monitoramento(void *pvParameters) {
     uint8_t falhas_consecutivas = 0;
     while (true) {
         if (estado_atual.load() == ESTADO_ATIRAR) {
-            if (pps_atual.load() < 50 && !scanner_pausa_ataque.load()) falhas_consecutivas++;
+            if ( (uint32_t)pps_atual.load() < 50 && !scanner_pausa_ataque.load()) falhas_consecutivas++;
             else falhas_consecutivas = 0;
 
             if (falhas_consecutivas > 3 && !alvo_perdido.load()) {
@@ -384,7 +384,7 @@ void task_monitoramento(void *pvParameters) {
                     xSemaphoreGive(scan_mutex);
                 }
                 
-                wifi_scan_config_t scan_config = { .ssid = 0, .bssid = mac_alvo, .channel = 0, .show_hidden = true };
+                wifi_scan_config_t scan_config = {}; scan_config.bssid = mac_alvo; scan_config.show_hidden = true;
                 
                 if (esp_wifi_scan_start(&scan_config, true) == ESP_OK) {
                     uint16_t num_aps = 1; wifi_ap_record_t ap_encontrado; 
@@ -410,8 +410,10 @@ void task_ataque(void *pvParameters) {
     CtsPacket* cts = (CtsPacket*) heap_caps_malloc(sizeof(CtsPacket), MALLOC_CAP_DMA);
     
     if (!pkt || !deauth || !auth || !cts) { 
-        if(pkt) heap_caps_free(pkt); if(deauth) heap_caps_free(deauth);
-        if(auth) heap_caps_free(auth); if(cts) heap_caps_free(cts);
+        if(pkt) heap_caps_free(pkt);
+        if(deauth) heap_caps_free(deauth);
+        if(auth) heap_caps_free(auth);
+        if(cts) heap_caps_free(cts);
         erro_memoria_critico.store(true); vTaskDelete(NULL); 
     }
     
@@ -657,62 +659,43 @@ void task_ataque(void *pvParameters) {
 void task_controles(void *pvParameters) {
     while (true) {
         M5.update(); 
-        
-        if (M5.Keyboard.isKeyPressed('A') || M5.Keyboard.isKeyPressed('a')) modo_ativo.store(MODO_AUTOMATICO);
-        if (M5.Keyboard.isKeyPressed('1')) modo_ativo.store(MODO_MANUAL_L2);
-        if (M5.Keyboard.isKeyPressed('2')) modo_ativo.store(MODO_MANUAL_L3);
-        if (M5.Keyboard.isKeyPressed('3')) modo_ativo.store(MODO_MANUAL_CTS);
-
         if (estado_atual.load() == ESTADO_SELECIONAR) {
             if (total_alvos > 0) {
-                if (M5.Keyboard.isKeyPressed(KEY_DOWN)) { alvo_selecionado = (alvo_selecionado + 1) % total_alvos; desenhar_menu(); vTaskDelay(pdMS_TO_TICKS(150)); }
-                if (M5.Keyboard.isKeyPressed(KEY_UP)) { alvo_selecionado = (alvo_selecionado - 1 + total_alvos) % total_alvos; desenhar_menu(); vTaskDelay(pdMS_TO_TICKS(150)); }
-            }
-            
-            if (M5.Keyboard.isKeyPressed(' ')) { 
-                if (!thermal_lock.load()) {
-                    tx_power_max_user.store(!tx_power_max_user.load()); 
-                    tx_power_max.store(tx_power_max_user.load()); 
+                if (M5.BtnA.wasPressed()) {
+                    alvo_selecionado = (alvo_selecionado + 1) % total_alvos; 
                     desenhar_menu(); 
                 }
-                vTaskDelay(pdMS_TO_TICKS(200)); 
-            }
-            
-            if (M5.Keyboard.isKeyPressed(KEY_ENTER)) {
-                if (total_alvos > 0) {
+                if (M5.BtnA.pressedFor(1000)) {
                     uint8_t ch = 1;
                     if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) {
                         ch = alvos_encontrados[alvo_selecionado].primary;
                         xSemaphoreGive(scan_mutex);
                     }
                     canal_atual_alvo.store(ch); 
-                    analisar_alvo_automaticamente(alvo_selecionado); modo_ativo.store(MODO_AUTOMATICO); 
-                    
+                    analisar_alvo_automaticamente(alvo_selecionado); 
+                    modo_ativo.store(MODO_AUTOMATICO); 
                     if(xSemaphoreTake(display_mutex, portMAX_DELAY)) {
                         M5.Display.clear(); 
                         xSemaphoreGive(display_mutex);
                     }
-                    
-                    flag_update_config.store(true); estado_atual.store(ESTADO_ATIRAR); 
-                } else { escanear_redes(); desenhar_menu(); }
-                vTaskDelay(pdMS_TO_TICKS(300));
+                    flag_update_config.store(true); 
+                    estado_atual.store(ESTADO_ATIRAR);
+                    while(M5.BtnA.isPressed()) { M5.update(); vTaskDelay(10); }
+                }
+            } else if (M5.BtnA.wasPressed()) {
+                escanear_redes(); desenhar_menu();
             }
         } 
         else if (estado_atual.load() == ESTADO_ATIRAR) {
-            if (M5.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
+            if (M5.BtnA.pressedFor(1000)) {
                 alvo_perdido.store(false); 
-                estado_atual.store(ESTADO_SELECIONAR); escanear_redes(); desenhar_menu(); vTaskDelay(pdMS_TO_TICKS(300));
-            }
-            if (M5.Keyboard.isKeyPressed(' ')) { 
-                if (!thermal_lock.load()) {
-                    tx_power_max_user.store(!tx_power_max_user.load()); 
-                    tx_power_max.store(tx_power_max_user.load()); 
-                    flag_update_config.store(true); 
-                }
-                vTaskDelay(pdMS_TO_TICKS(200)); 
+                estado_atual.store(ESTADO_SELECIONAR); 
+                escanear_redes(); 
+                desenhar_menu();
+                while(M5.BtnA.isPressed()) { M5.update(); vTaskDelay(10); }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(10)); 
+        vTaskDelay(pdMS_TO_TICKS(50)); 
     }
 }
 
